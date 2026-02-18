@@ -1,0 +1,28 @@
+#!/bin/bash
+# Omarchy theme-set hook: Sync Bibata cursor colors with theme
+#
+# This hook is called by omarchy-theme-set after a theme change.
+# It rebuilds/applies a Bibata cursor theme with colors matching the new theme.
+
+THEME_NAME="$1"
+
+if [[ -z "$THEME_NAME" ]]; then
+    echo "theme-set hook: No theme name provided"
+    exit 0
+fi
+
+# Path to cursor sync script
+CURSOR_SYNC="$HOME/.local/bin/cursor-sync"
+
+if [[ ! -x "$CURSOR_SYNC" ]]; then
+    echo "theme-set hook: cursor-sync not found or not executable"
+    exit 0
+fi
+
+echo "Syncing cursor colors for theme: $THEME_NAME"
+
+# Run cursor sync in background to not block theme switching
+# Redirect output to log file
+"$CURSOR_SYNC" "$THEME_NAME" >> "$HOME/.local/share/bibata-omarchy-cache/hook.log" 2>&1 &
+
+exit 0

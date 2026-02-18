@@ -1,0 +1,14 @@
+#!/bin/bash
+# Omarchy Cursor Sync Wrapper
+# Syncs Bibata cursor colors with current Omarchy theme
+
+VENV_PYTHON="$HOME/.local/bibata-venv/bin/python"
+SCRIPT="$HOME/.local/bin/omarchy-sync-cursor"
+
+if [[ ! -f "$VENV_PYTHON" ]]; then
+    echo "Error: Python venv not found at $VENV_PYTHON"
+    echo "Please run: python3 -m venv ~/.local/bibata-venv && ~/.local/bibata-venv/bin/pip install clickgen toml"
+    exit 1
+fi
+
+exec "$VENV_PYTHON" "$SCRIPT" "$@"

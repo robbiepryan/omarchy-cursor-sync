@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""
+Omarchy Cursor Sync - Automatically build and apply Bibata cursors matching theme colors.
+
+This script:
+1. Reads colors from the current Omarchy theme's alacritty.toml
+2. Computes aesthetically pleasing cursor colors from the palette
+3. Builds a custom Bibata cursor theme using cbmp + ctgen
+4. Installs and applies the cursor across Hyprland, XCursor, and GTK
+
+Usage:
+    omarchy-sync-cursor <theme_name>
+    omarchy-sync-cursor --current     # Uses currently active theme
+"""
+
+import os
+import sys
+import subprocess
+import hashlib
+import json
+import shutil
+import argparse
+import logging
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
+
+# Try to import toml - fall back to simple parser if not available
+try:
+    import toml
+    HAS_TOML = True
+except ImportError:
+    HAS_TOML = False
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass
+class Config:
+    """Configuration for cursor sync."""
+    bibata_source_dir: Path
+    cache_dir: Path
+    icons_dir: Path
+    themes_dir: Path
+    cursor_size: int
+    cursor_style: str
+    color_source: str
+    cursor_conf: Path
+    base_color_source: str
+    base_color_fallback: str
+    outline_color_source: str
+    watch_color_source: str
+    venv_path: Path
+
+def load_config() -> Config:
+    """Load configuration from config.toml or use defaults."""
+    config_path = Path.home() / ".config" / "bibata-omarchy-sync" / "config.toml"
+    
+    # Defaults
+    defaults = {
+        "bibata_source_dir": Path.home() / "src" / "Bibata_Cursor",
+        "cache_dir": Path.home() / ".local" / "share" / "bibata-omarchy-cache",
+        "icons_dir": Path.home() / ".local" / "share" / "icons",
+        "themes_dir": Path.home() / ".config" / "omarchy" / "themes",
+        "cursor_size": 24,
+        "cursor_style": "modern",
+        "color_source": "alacritty.toml",
+        "cursor_conf": Path.home() / ".config" / "hypr" / "cursor-auto.conf",
+        "base_color_source": "cursor",
+        "base_color_fallback": "magenta",
+        "outline_color_source": "background",
+        "watch_color_source": "background",
+        "venv_path": Path.home() / ".local" / "bibata-venv",
+    }
+    
+    if config_path.exists() and HAS_TOML:
+        try:
+            data = toml.load(config_path)
+            paths = data.get("paths", {})
+            cursor = data.get("cursor", {})
+            hyprland = data.get("hyprland", {})
+            color_mapping = data.get("color_mapping", {})
+            
+            def expand_path(p: str) -> Path:
+                return Path(os.path.expanduser(p))
+            
+            return Config(
+                bibata_source_dir=expand_path(paths.get("bibata_source_dir", str(defaults["bibata_source_dir"]))),
+                cache_dir=expand_path(paths.get("cache_dir", str(defaults["cache_dir"]))),
+                icons_dir=expand_path(paths.get("icons_dir", str(defaults["icons_dir"]))),
+                themes_dir=expand_path(paths.get("themes_dir", str(defaults["themes_dir"]))),
+                cursor_size=cursor.get("size", defaults["cursor_size"]),
+                cursor_style=cursor.get("style", defaults["cursor_style"]),
+                color_source=cursor.get("color_source", defaults["color_source"]),
+                cursor_conf=expand_path(hyprland.get("cursor_conf", str(defaults["cursor_conf"]))),
+                base_color_source=color_mapping.get("base_color_source", defaults["base_color_source"]),
+                base_color_fallback=color_mapping.get("base_color_fallback", defaults["base_color_fallback"]),
+                outline_color_source=color_mapping.get("outline_color_source", defaults["outline_color_source"]),
+                watch_color_source=color_mapping.get("watch_color_source", defaults["watch_color_source"]),
+                venv_path=defaults["venv_path"],
+            )
+        except Exception as e:
+            logging.warning(f"Error loading config: {e}, using defaults")
+    
+    return Config(**defaults)
+
+# ============================================================================
+# Color Utilities
+# ============================================================================
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color to RGB tuple."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    """Convert RGB to hex color."""
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def relative_luminance(hex_color: str) -> float:
+    """Calculate relative luminance of a color (0-1 scale)."""
+    r, g, b = hex_to_rgb(hex_color)
+    # Convert to sRGB
+    def linearize(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+
+def contrast_ratio(color1: str, color2: str) -> float:
+    """Calculate contrast ratio between two colors."""
+    l1 = relative_luminance(color1)
+    l2 = relative_luminance(color2)
+    lighter = max(l1, l2)
+    darker = min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+def darken_color(hex_color: str, factor: float = 0.3) -> str:
+    """Darken a color by a factor (0-1)."""
+    r, g, b = hex_to_rgb(hex_color)
+    r = int(r * (1 - factor))
+    g = int(g * (1 - factor))
+    b = int(b * (1 - factor))
+    return rgb_to_hex(r, g, b)
+
+def lighten_color(hex_color: str, factor: float = 0.3) -> str:
+    """Lighten a color by a factor (0-1)."""
+    r, g, b = hex_to_rgb(hex_color)
+    r = min(255, int(r + (255 - r) * factor))
+    g = min(255, int(g + (255 - g) * factor))
+    b = min(255, int(b + (255 - b) * factor))
+    return rgb_to_hex(r, g, b)
+
+def is_light_color(hex_color: str) -> bool:
+    """Check if a color is light (luminance > 0.5)."""
+    return relative_luminance(hex_color) > 0.5
+
+def get_saturation(hex_color: str) -> float:
+    """Get saturation of a color (0-1 scale)."""
+    r, g, b = hex_to_rgb(hex_color)
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    if max_c == 0:
+        return 0.0
+    return (max_c - min_c) / max_c
+
+def is_vibrant(hex_color: str, min_saturation: float = 0.3) -> bool:
+    """Check if a color is vibrant enough to be visually interesting."""
+    return get_saturation(hex_color) >= min_saturation
+
+def ensure_contrast(base: str, outline: str, min_ratio: float = 3.0) -> str:
+    """Adjust outline color to ensure minimum contrast with base."""
+    if contrast_ratio(base, outline) >= min_ratio:
+        return outline
+    
+    # If base is light, make outline darker; otherwise lighter
+    if is_light_color(base):
+        adjusted = outline
+        for _ in range(10):
+            adjusted = darken_color(adjusted, 0.15)
+            if contrast_ratio(base, adjusted) >= min_ratio:
+                return adjusted
+        return "#000000"
+    else:
+        adjusted = outline
+        for _ in range(10):
+            adjusted = lighten_color(adjusted, 0.15)
+            if contrast_ratio(base, adjusted) >= min_ratio:
+                return adjusted
+        return "#ffffff"
+
+# ============================================================================
+# Theme Color Parsing
+# ============================================================================
+
+def parse_alacritty_toml_simple(content: str) -> Dict:
+    """Simple TOML parser for alacritty.toml (handles nested sections)."""
+    result = {}
+    current_section = []
+    
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        
+        # Section header
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1]
+            # Handle [[array]] notation
+            if section.startswith('[') and section.endswith(']'):
+                continue  # Skip array sections for now
+            current_section = section.split('.')
+            # Ensure nested structure exists
+            d = result
+            for key in current_section:
+                if key not in d:
+                    d[key] = {}
+                d = d[key]
+        elif '=' in line:
+            # Key-value pair
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"\'')
+            
+            # Navigate to current section and set value
+            d = result
+            for section_key in current_section:
+                d = d.get(section_key, {})
+            if isinstance(d, dict):
+                d[key] = value
+    
+    return result
+
+def extract_theme_colors(theme_path: Path, color_source: str) -> Dict[str, str]:
+    """Extract colors from theme's color source file."""
+    color_file = theme_path / color_source
+    if not color_file.exists():
+        raise FileNotFoundError(f"Color file not found: {color_file}")
+    
+    content = color_file.read_text()
+    
+    if HAS_TOML:
+        data = toml.loads(content)
+    else:
+        data = parse_alacritty_toml_simple(content)
+    
+    colors = {}
+    
+    # Extract primary colors
+    primary = data.get("colors", {}).get("primary", {})
+    colors["background"] = primary.get("background", "#1e1e2e")
+    colors["foreground"] = primary.get("foreground", "#cdd6f4")
+    
+    # Extract cursor colors if available
+    cursor = data.get("colors", {}).get("cursor", {})
+    colors["cursor"] = cursor.get("cursor", colors["foreground"])
+    colors["cursor_text"] = cursor.get("text", colors["background"])
+    
+    # Extract selection colors
+    selection = data.get("colors", {}).get("selection", {})
+    colors["selection_bg"] = selection.get("background", colors["foreground"])
+    
+    # Extract normal palette colors
+    normal = data.get("colors", {}).get("normal", {})
+    colors["black"] = normal.get("black", "#45475a")
+    colors["red"] = normal.get("red", "#f38ba8")
+    colors["green"] = normal.get("green", "#a6e3a1")
+    colors["yellow"] = normal.get("yellow", "#f9e2af")
+    colors["blue"] = normal.get("blue", "#89b4fa")
+    colors["magenta"] = normal.get("magenta", "#f5c2e7")
+    colors["cyan"] = normal.get("cyan", "#94e2d5")
+    colors["white"] = normal.get("white", "#bac2de")
+    
+    # Extract bright palette (useful for accents)
+    bright = data.get("colors", {}).get("bright", {})
+    colors["bright_magenta"] = bright.get("magenta", colors["magenta"])
+    colors["bright_cyan"] = bright.get("cyan", colors["cyan"])
+    colors["bright_blue"] = bright.get("blue", colors["blue"])
+    
+    return colors
+
+# ============================================================================
+# Aesthetic Color Selection
+# ============================================================================
+
+def compute_cursor_colors(colors: Dict[str, str], config: Config) -> Tuple[str, str, str]:
+    """
+    Compute aesthetically pleasing cursor colors from theme palette.
+    
+    Design principles:
+    1. Base color should be vibrant and visible - use accent/cursor color
+    2. Outline should provide strong contrast for visibility
+    3. Watch background should be subtle but harmonious
+    """
+    background = colors.get("background", "#1e1e2e")
+    foreground = colors.get("foreground", "#cdd6f4")
+    
+    # === BASE COLOR ===
+    # Priority: cursor color (if distinct) > magenta > cyan > blue
+    # We want something that "pops" against both light and dark backgrounds
+    
+    base_source = config.base_color_source
+    base_fallback = config.base_color_fallback
+    
+    # Try primary source
+    if base_source == "cursor":
+        base_color = colors.get("cursor", "")
+        # Only use cursor color if it's distinct from foreground
+        if not base_color or base_color == foreground:
+            base_color = ""
+    elif base_source in colors:
+        base_color = colors[base_source]
+    else:
+        base_color = ""
+    
+    # Fallback to accent colors if primary source is empty/unsuitable
+    if not base_color:
+        # Try fallback, then other accent colors - prefer vibrant colors
+        for color_key in [base_fallback, "magenta", "bright_magenta", "cyan", "bright_cyan", "blue", "red", "green", "yellow"]:
+            candidate = colors.get(color_key, "")
+            if candidate and contrast_ratio(candidate, background) >= 2.5 and is_vibrant(candidate, 0.25):
+                base_color = candidate
+                break
+        
+        # If no vibrant color found (monochrome theme), use foreground with good contrast
+        if not base_color:
+            base_color = colors.get("foreground", "#ffffff")
+    
+    # === OUTLINE COLOR ===
+    # Should contrast well with both base color AND provide cursor visibility
+    
+    outline_source = config.outline_color_source
+    
+    if outline_source == "auto_contrast":
+        # Auto-select based on base color luminance
+        if is_light_color(base_color):
+            outline_color = darken_color(background, 0.2) if not is_light_color(background) else "#000000"
+        else:
+            outline_color = lighten_color(background, 0.2) if is_light_color(background) else "#ffffff"
+    elif outline_source == "background":
+        outline_color = background
+    elif outline_source in colors:
+        outline_color = colors[outline_source]
+    else:
+        outline_color = background
+    
+    # Ensure minimum contrast
+    outline_color = ensure_contrast(base_color, outline_color, min_ratio=3.5)
+    
+    # === WATCH BACKGROUND COLOR ===
+    # For loading animations - should be darker/more subtle
+    
+    watch_source = config.watch_color_source
+    
+    if watch_source == "auto_darken":
+        # Create a darkened version of background
+        watch_color = darken_color(background, 0.3)
+    elif watch_source == "selection_background":
+        watch_color = colors.get("selection_bg", background)
+        # Make it a bit darker for better animation visibility
+        if relative_luminance(watch_color) > 0.3:
+            watch_color = darken_color(watch_color, 0.4)
+    elif watch_source == "background":
+        watch_color = darken_color(background, 0.2)
+    elif watch_source in colors:
+        watch_color = colors[watch_source]
+    else:
+        watch_color = darken_color(background, 0.2)
+    
+    # Ensure watch color is darker for better loading animation contrast
+    if relative_luminance(watch_color) > 0.4:
+        watch_color = darken_color(watch_color, 0.5)
+    
+    return base_color.upper(), outline_color.upper(), watch_color.upper()
+
+# ============================================================================
+# Caching
+# ============================================================================
+
+def get_theme_hash(theme_path: Path, color_source: str) -> str:
+    """Generate a hash of the color file for cache validation."""
+    color_file = theme_path / color_source
+    if color_file.exists():
+        content = color_file.read_bytes()
+        return hashlib.sha256(content).hexdigest()[:16]
+    return ""
+
+def get_cursor_theme_name(theme_name: str) -> str:
+    """Generate a safe cursor theme name."""
+    # Make filesystem-safe
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "-" for c in theme_name)
+    return f"Bibata-Omarchy-{safe_name}"
+
+def check_cache(config: Config, theme_name: str, theme_hash: str) -> bool:
+    """Check if a valid cached cursor theme exists."""
+    cursor_theme_name = get_cursor_theme_name(theme_name)
+    theme_dest = config.icons_dir / cursor_theme_name
+    cache_meta = config.cache_dir / theme_name / "meta.json"
+    
+    if not theme_dest.exists() or not cache_meta.exists():
+        return False
+    
+    try:
+        with open(cache_meta) as f:
+            meta = json.load(f)
+        return meta.get("hash") == theme_hash
+    except Exception:
+        return False
+
+def update_cache_meta(config: Config, theme_name: str, theme_hash: str, cursor_theme_name: str):
+    """Update cache metadata after successful build."""
+    cache_theme_dir = config.cache_dir / theme_name
+    cache_theme_dir.mkdir(parents=True, exist_ok=True)
+    
+    meta = {
+        "hash": theme_hash,
+        "cursor_theme_name": cursor_theme_name,
+    }
+    
+    with open(cache_theme_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+# ============================================================================
+# Cursor Building
+# ============================================================================
+
+def build_cursor_theme(
+    config: Config,
+    theme_name: str,
+    base_color: str,
+    outline_color: str,
+    watch_color: str,
+    logger: logging.Logger
+) -> Path:
+    """Build Bibata cursor theme with custom colors."""
+    
+    cursor_theme_name = get_cursor_theme_name(theme_name)
+    bitmap_dir = config.cache_dir / theme_name / "bitmaps"
+    
+    # Ensure clean bitmap directory
+    if bitmap_dir.exists():
+        shutil.rmtree(bitmap_dir)
+    bitmap_dir.mkdir(parents=True, exist_ok=True)
+    
+    svg_dir = config.bibata_source_dir / "svg" / config.cursor_style
+    
+    if not svg_dir.exists():
+        raise FileNotFoundError(f"SVG directory not found: {svg_dir}")
+    
+    # Step 1: Run cbmp to render SVGs to PNGs
+    logger.info(f"Rendering cursor bitmaps with colors: base={base_color}, outline={outline_color}, watch={watch_color}")
+    
+    cbmp_cmd = [
+        "npx", "cbmp",
+        "-d", str(svg_dir),
+        "-o", str(bitmap_dir),
+        "-bc", base_color,
+        "-oc", outline_color,
+        "-wc", watch_color
+    ]
+    
+    result = subprocess.run(
+        cbmp_cmd,
+        cwd=config.bibata_source_dir,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        logger.error(f"cbmp failed: {result.stderr}")
+        raise RuntimeError(f"cbmp failed: {result.stderr}")
+    
+    logger.info("Bitmap rendering complete")
+    
+    # Step 2: Run ctgen to build cursor theme
+    logger.info(f"Building cursor theme: {cursor_theme_name}")
+    
+    # Find build.toml - check configs directory first
+    build_toml = config.bibata_source_dir / "configs" / "normal" / "x.build.toml"
+    if not build_toml.exists():
+        build_toml = config.bibata_source_dir / "build.toml"
+    
+    if not build_toml.exists():
+        raise FileNotFoundError(f"build.toml not found in {config.bibata_source_dir}")
+    
+    ctgen_path = config.venv_path / "bin" / "ctgen"
+    
+    ctgen_cmd = [
+        str(ctgen_path),
+        str(build_toml),
+        "-d", str(bitmap_dir),
+        "-n", cursor_theme_name,
+        "-c", f"Omarchy {theme_name} Bibata cursor theme"
+    ]
+    
+    result = subprocess.run(
+        ctgen_cmd,
+        cwd=config.bibata_source_dir,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        logger.error(f"ctgen failed: {result.stderr}")
+        raise RuntimeError(f"ctgen failed: {result.stderr}")
+    
+    logger.info("Cursor theme build complete")
+    
+    # Find built theme
+    theme_src = config.bibata_source_dir / "themes" / cursor_theme_name
+    if not theme_src.exists():
+        # Check in current working directory
+        theme_src = Path.cwd() / "themes" / cursor_theme_name
+    
+    if not theme_src.exists():
+        raise FileNotFoundError(f"Built theme not found at {theme_src}")
+    
+    return theme_src
+
+def install_cursor_theme(config: Config, theme_src: Path, cursor_theme_name: str, logger: logging.Logger):
+    """Install cursor theme to icons directory."""
+    theme_dest = config.icons_dir / cursor_theme_name
+    
+    logger.info(f"Installing cursor theme to {theme_dest}")
+    
+    # Remove existing
+    if theme_dest.exists():
+        shutil.rmtree(theme_dest)
+    
+    # Ensure icons directory exists
+    config.icons_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy theme
+    shutil.copytree(theme_src, theme_dest)
+    
+    logger.info("Cursor theme installed")
+
+# ============================================================================
+# Cursor Application
+# ============================================================================
+
+def apply_cursor_hyprland(cursor_theme_name: str, size: int, logger: logging.Logger):
+    """Apply cursor theme in Hyprland."""
+    logger.info(f"Applying cursor in Hyprland: {cursor_theme_name} (size {size})")
+    
+    # Runtime apply
+    result = subprocess.run(
+        ["hyprctl", "setcursor", cursor_theme_name, str(size)],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        logger.warning(f"hyprctl setcursor failed (may not be running): {result.stderr}")
+
+def write_cursor_config(config: Config, cursor_theme_name: str, logger: logging.Logger):
+    """Write cursor configuration for persistence."""
+    logger.info(f"Writing cursor config to {config.cursor_conf}")
+    
+    config.cursor_conf.parent.mkdir(parents=True, exist_ok=True)
+    
+    content = f"""# Auto-generated by omarchy-sync-cursor
+# Cursor theme configuration
+
+env = HYPRCURSOR_THEME,{cursor_theme_name}
+env = HYPRCURSOR_SIZE,{config.cursor_size}
+env = XCURSOR_THEME,{cursor_theme_name}
+env = XCURSOR_SIZE,{config.cursor_size}
+"""
+    
+    config.cursor_conf.write_text(content)
+
+def apply_cursor_gtk(cursor_theme_name: str, size: int, logger: logging.Logger):
+    """Apply cursor theme for GTK applications."""
+    logger.info(f"Applying cursor for GTK: {cursor_theme_name}")
+    
+    # Try gsettings
+    try:
+        subprocess.run(
+            ["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", cursor_theme_name],
+            capture_output=True,
+            check=True
+        )
+        subprocess.run(
+            ["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", str(size)],
+            capture_output=True,
+            check=True
+        )
+    except Exception as e:
+        logger.warning(f"gsettings failed (may not be available): {e}")
+        
+        # Fallback: Write GTK settings files
+        write_gtk_fallback(cursor_theme_name, size, logger)
+
+def write_gtk_fallback(cursor_theme_name: str, size: int, logger: logging.Logger):
+    """Write GTK cursor settings to config files."""
+    # GTK 2
+    gtk2_rc = Path.home() / ".gtkrc-2.0"
+    try:
+        existing = gtk2_rc.read_text() if gtk2_rc.exists() else ""
+        # Remove existing cursor lines
+        lines = [l for l in existing.splitlines() if not l.startswith("gtk-cursor-theme")]
+        lines.extend([
+            f'gtk-cursor-theme-name="{cursor_theme_name}"',
+            f'gtk-cursor-theme-size={size}'
+        ])
+        gtk2_rc.write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write GTK2 config: {e}")
+    
+    # GTK 3
+    gtk3_dir = Path.home() / ".config" / "gtk-3.0"
+    gtk3_settings = gtk3_dir / "settings.ini"
+    try:
+        gtk3_dir.mkdir(parents=True, exist_ok=True)
+        existing = gtk3_settings.read_text() if gtk3_settings.exists() else "[Settings]\n"
+        
+        # Simple append/update - a proper INI parser would be better
+        if "gtk-cursor-theme-name" not in existing:
+            existing += f"gtk-cursor-theme-name={cursor_theme_name}\n"
+        if "gtk-cursor-theme-size" not in existing:
+            existing += f"gtk-cursor-theme-size={size}\n"
+        
+        gtk3_settings.write_text(existing)
+    except Exception as e:
+        logger.warning(f"Failed to write GTK3 config: {e}")
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def setup_logging(config: Config) -> logging.Logger:
+    """Set up logging to file and console."""
+    logger = logging.getLogger("omarchy-sync-cursor")
+    logger.setLevel(logging.INFO)
+    
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(console)
+    
+    # File handler
+    log_file = config.cache_dir / "sync.log"
+    config.cache_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(file_handler)
+    
+    return logger
+
+def get_current_theme() -> Optional[str]:
+    """Try to determine the currently active Omarchy theme."""
+    # Check for a theme indicator file
+    active_file = Path.home() / ".config" / "omarchy" / "active-theme"
+    if active_file.exists():
+        return active_file.read_text().strip()
+    
+    # Try to read from a symlink
+    current_link = Path.home() / ".config" / "omarchy" / "current-theme"
+    if current_link.is_symlink():
+        return current_link.resolve().name
+    
+    return None
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sync Bibata cursor colors with Omarchy theme"
+    )
+    parser.add_argument(
+        "theme",
+        nargs="?",
+        help="Theme name to sync cursor colors with"
+    )
+    parser.add_argument(
+        "--current",
+        action="store_true",
+        help="Use currently active theme"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force rebuild even if cached"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes"
+    )
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config()
+    logger = setup_logging(config)
+    
+    # Determine theme name
+    if args.current:
+        theme_name = get_current_theme()
+        if not theme_name:
+            logger.error("Could not determine current theme. Please specify theme name.")
+            sys.exit(1)
+    elif args.theme:
+        theme_name = args.theme
+    else:
+        parser.print_help()
+        sys.exit(1)
+    
+    logger.info(f"Syncing cursor for theme: {theme_name}")
+    
+    # Resolve theme path
+    theme_path = config.themes_dir / theme_name
+    if not theme_path.exists():
+        logger.error(f"Theme not found: {theme_path}")
+        sys.exit(1)
+    
+    cursor_theme_name = get_cursor_theme_name(theme_name)
+    
+    try:
+        # Extract colors
+        logger.info("Extracting theme colors...")
+        colors = extract_theme_colors(theme_path, config.color_source)
+        
+        # Compute cursor colors
+        base_color, outline_color, watch_color = compute_cursor_colors(colors, config)
+        logger.info(f"Computed cursor colors:")
+        logger.info(f"  Base:    {base_color}")
+        logger.info(f"  Outline: {outline_color}")
+        logger.info(f"  Watch:   {watch_color}")
+        
+        if args.dry_run:
+            logger.info("Dry run - no changes made")
+            sys.exit(0)
+        
+        # Check cache
+        theme_hash = get_theme_hash(theme_path, config.color_source)
+        if not args.force and check_cache(config, theme_name, theme_hash):
+            logger.info("Using cached cursor theme (colors unchanged)")
+        else:
+            # Build cursor theme
+            logger.info("Building cursor theme...")
+            theme_src = build_cursor_theme(
+                config, theme_name,
+                base_color, outline_color, watch_color,
+                logger
+            )
+            
+            # Install
+            install_cursor_theme(config, theme_src, cursor_theme_name, logger)
+            
+            # Update cache
+            update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
+        
+        # Apply cursor
+        apply_cursor_hyprland(cursor_theme_name, config.cursor_size, logger)
+        write_cursor_config(config, cursor_theme_name, logger)
+        apply_cursor_gtk(cursor_theme_name, config.cursor_size, logger)
+        
+        logger.info(f"✓ Cursor synced successfully: {cursor_theme_name}")
+        
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        logger.error(f"Build failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

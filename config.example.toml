@@ -1,0 +1,46 @@
+# Bibata Omarchy Cursor Sync Configuration
+# This file controls how cursors are built and applied when themes change
+
+[paths]
+# Path to the Bibata cursor source repository
+bibata_source_dir = "~/src/Bibata_Cursor"
+
+# Directory for caching built cursors and intermediate files
+cache_dir = "~/.local/share/bibata-omarchy-cache"
+
+# Directory where themes are installed
+icons_dir = "~/.local/share/icons"
+
+# Path to Omarchy themes
+themes_dir = "~/.config/omarchy/themes"
+
+[cursor]
+# Cursor size (common values: 24, 32, 48)
+size = 24
+
+# SVG style to use: "modern" (rounded) or "original" (sharp edges)
+style = "modern"
+
+# Color source file within theme directory
+color_source = "alacritty.toml"
+
+[hyprland]
+# Path to write cursor configuration for Hyprland
+cursor_conf = "~/.config/hypr/cursor-auto.conf"
+
+[color_mapping]
+# Color selection strategy for cursor colors
+# These define which theme colors to use for cursor parts
+
+# Base color: The main fill color of the cursor
+# Options: "accent", "cursor", "blue", "magenta", "cyan", "foreground"
+base_color_source = "cursor"
+base_color_fallback = "magenta"
+
+# Outline color: The border/outline of the cursor  
+# Options: "background", "black", "foreground", "auto_contrast"
+outline_color_source = "background"
+
+# Watch background color: Background for loading/wait cursor animations
+# Options: "selection_background", "background", "black", "auto_darken"
+watch_color_source = "background"
