@@ -253,7 +253,7 @@ def generate_random_vibrant_color() -> str:
     return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
 
 def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
-    """Open a GUI color picker dialog with live preview swatch.
+    """Open an advanced GUI color picker with cursor preview, HSV sliders, and presets.
 
     Args:
         initial_color: Starting color in hex format
@@ -263,9 +263,9 @@ def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
     """
     try:
         import tkinter as tk
-        from tkinter import colorchooser
+        from tkinter import ttk
     except ImportError:
-        raise RuntimeError("tkinter is required for --picker. Install python-tk package.")
+        raise RuntimeError("tkinter is required for --picker. Install tk package (sudo pacman -S tk).")
 
     # Normalize initial color
     try:
@@ -273,72 +273,123 @@ def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
     except ValueError:
         initial_color = "#ff00ff"
 
+    # Theme colors
+    BG_DARK = "#1e1e2e"
+    BG_MID = "#313244"
+    BG_LIGHT = "#45475a"
+    FG_TEXT = "#cdd6f4"
+    FG_DIM = "#a6adc8"
+    ACCENT = "#cba6f7"
+
+    # Preset vibrant colors
+    PRESETS = [
+        "#f38ba8", "#fab387", "#f9e2af", "#a6e3a1",
+        "#94e2d5", "#89dceb", "#74c7ec", "#89b4fa",
+        "#b4befe", "#cba6f7", "#f5c2e7", "#eba0ac",
+        "#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff",
+    ]
+
     root = tk.Tk()
     root.title("Cursor Color Picker")
-    root.geometry("400x300")
-    root.configure(bg="#1e1e2e")
+    root.configure(bg=BG_DARK)
+    root.resizable(False, False)
 
-    selected_color = [None]  # Use list to allow modification in nested function
+    selected_color = [None]
+    current_hsv = list(colorsys.rgb_to_hsv(*[x/255 for x in hex_to_rgb(initial_color)]))
 
-    # Title
-    title = tk.Label(
-        root,
-        text="Choose Cursor Color",
-        font=("Sans", 16, "bold"),
-        fg="#cdd6f4",
-        bg="#1e1e2e"
-    )
-    title.pack(pady=20)
+    def hsv_to_hex(h, s, v):
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
 
-    # Preview frame
-    preview_frame = tk.Frame(root, bg="#1e1e2e")
-    preview_frame.pack(pady=10)
+    def update_from_hsv(*args):
+        color = hsv_to_hex(current_hsv[0], current_hsv[1], current_hsv[2])
+        update_preview(color)
 
-    # Color preview swatch
-    preview_label = tk.Label(
-        preview_frame,
-        text="Preview",
-        fg="#cdd6f4",
-        bg="#1e1e2e"
-    )
-    preview_label.pack()
+    def update_preview(color):
+        hex_var.set(color.upper())
+        outline = ensure_contrast(color, BG_DARK)
+        draw_cursor(color, outline)
+        update_slider_colors()
 
-    color_swatch = tk.Canvas(
-        preview_frame,
-        width=120,
-        height=80,
-        bg=initial_color,
-        highlightthickness=2,
-        highlightbackground="#45475a"
-    )
-    color_swatch.pack(pady=5)
+    def draw_cursor(fill_color, outline_color):
+        """Draw a cursor-shaped preview."""
+        canvas.delete("all")
 
-    # Hex value display
-    hex_var = tk.StringVar(value=initial_color)
-    hex_label = tk.Label(
-        preview_frame,
-        textvariable=hex_var,
-        font=("Monospace", 12),
-        fg="#a6e3a1",
-        bg="#1e1e2e"
-    )
-    hex_label.pack()
+        # Draw background
+        canvas.create_rectangle(0, 0, 160, 140, fill=BG_MID, outline="")
 
-    current_color = [initial_color]
+        # Cursor shape points (arrow pointer) - scaled up
+        cx, cy = 80, 70  # center
+        points = [
+            cx - 30, cy - 40,  # top
+            cx - 30, cy + 20,  # left bottom
+            cx - 15, cy + 10,  # inner left
+            cx - 5, cy + 35,   # tail left
+            cx + 5, cy + 30,   # tail right
+            cx + 0, cy + 10,   # inner right
+            cx + 20, cy + 10,  # right point
+        ]
 
-    def pick_color():
-        # Open the color chooser
-        color = colorchooser.askcolor(
-            color=current_color[0],
-            title="Select Cursor Color"
-        )
-        if color[1]:  # color is ((r,g,b), "#hexcode")
-            current_color[0] = color[1]
-            color_swatch.configure(bg=color[1])
-            hex_var.set(color[1])
+        # Draw shadow
+        shadow_points = [p + 3 for p in points]
+        canvas.create_polygon(shadow_points, fill="#11111b", outline="")
+
+        # Draw outline (larger cursor behind)
+        canvas.create_polygon(points, fill=outline_color, outline=outline_color, width=6)
+
+        # Draw fill
+        canvas.create_polygon(points, fill=fill_color, outline="")
+
+        # Label
+        canvas.create_text(80, 125, text="Preview", fill=FG_DIM, font=("Sans", 9))
+
+    def update_slider_colors():
+        """Update slider trough colors to show gradients."""
+        # This is a visual hint - full gradient would need custom widget
+        pass
+
+    def set_color_from_hex(hex_color):
+        try:
+            hex_color = validate_hex_color(hex_color)
+            r, g, b = hex_to_rgb(hex_color)
+            h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+            current_hsv[0], current_hsv[1], current_hsv[2] = h, s, v
+            hue_var.set(h * 360)
+            sat_var.set(s * 100)
+            val_var.set(v * 100)
+            update_preview(hex_color)
+        except ValueError:
+            pass
+
+    def on_slider_change(*args):
+        current_hsv[0] = hue_var.get() / 360
+        current_hsv[1] = sat_var.get() / 100
+        current_hsv[2] = val_var.get() / 100
+        update_from_hsv()
+
+    def on_preset_click(color):
+        set_color_from_hex(color)
+
+    def on_random():
+        color = generate_random_vibrant_color()
+        set_color_from_hex(color)
+
+    def on_hex_entry(*args):
+        try:
+            color = validate_hex_color(hex_var.get())
+            r, g, b = hex_to_rgb(color)
+            h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+            current_hsv[0], current_hsv[1], current_hsv[2] = h, s, v
+            hue_var.set(h * 360)
+            sat_var.set(s * 100)
+            val_var.set(v * 100)
+            outline = ensure_contrast(color, BG_DARK)
+            draw_cursor(color, outline)
+        except ValueError:
+            pass
 
     def confirm():
-        selected_color[0] = current_color[0]
+        selected_color[0] = hex_var.get().lower()
         root.quit()
         root.destroy()
 
@@ -346,73 +397,195 @@ def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
         root.quit()
         root.destroy()
 
-    def random_color():
-        new_color = generate_random_vibrant_color()
-        current_color[0] = new_color
-        color_swatch.configure(bg=new_color)
-        hex_var.set(new_color)
+    # === Layout ===
 
-    # Buttons frame
-    btn_frame = tk.Frame(root, bg="#1e1e2e")
-    btn_frame.pack(pady=20)
+    # Main container
+    main_frame = tk.Frame(root, bg=BG_DARK, padx=20, pady=15)
+    main_frame.pack(fill=tk.BOTH, expand=True)
 
-    pick_btn = tk.Button(
-        btn_frame,
-        text="Pick Color",
-        command=pick_color,
-        bg="#89b4fa",
-        fg="#1e1e2e",
-        font=("Sans", 10),
-        padx=15,
-        pady=5
+    # Title
+    title = tk.Label(
+        main_frame,
+        text="Cursor Color Picker",
+        font=("Sans", 14, "bold"),
+        fg=FG_TEXT,
+        bg=BG_DARK
     )
-    pick_btn.pack(side=tk.LEFT, padx=5)
+    title.pack(pady=(0, 15))
 
+    # Content frame (left: preview, right: controls)
+    content = tk.Frame(main_frame, bg=BG_DARK)
+    content.pack(fill=tk.BOTH, expand=True)
+
+    # Left side - Cursor preview
+    left_frame = tk.Frame(content, bg=BG_DARK)
+    left_frame.pack(side=tk.LEFT, padx=(0, 20))
+
+    canvas = tk.Canvas(
+        left_frame,
+        width=160,
+        height=140,
+        bg=BG_MID,
+        highlightthickness=1,
+        highlightbackground=BG_LIGHT
+    )
+    canvas.pack()
+
+    # Hex display/entry
+    hex_var = tk.StringVar(value=initial_color.upper())
+    hex_entry = tk.Entry(
+        left_frame,
+        textvariable=hex_var,
+        font=("Monospace", 12, "bold"),
+        fg=ACCENT,
+        bg=BG_MID,
+        insertbackground=FG_TEXT,
+        justify=tk.CENTER,
+        width=10,
+        relief=tk.FLAT
+    )
+    hex_entry.pack(pady=(10, 0))
+    hex_entry.bind("<Return>", on_hex_entry)
+    hex_entry.bind("<FocusOut>", on_hex_entry)
+
+    # Right side - Controls
+    right_frame = tk.Frame(content, bg=BG_DARK)
+    right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # HSV Sliders
+    slider_frame = tk.Frame(right_frame, bg=BG_DARK)
+    slider_frame.pack(fill=tk.X, pady=(0, 15))
+
+    # Slider style
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure("Custom.Horizontal.TScale", background=BG_DARK, troughcolor=BG_MID)
+
+    h, s, v = current_hsv
+    hue_var = tk.DoubleVar(value=h * 360)
+    sat_var = tk.DoubleVar(value=s * 100)
+    val_var = tk.DoubleVar(value=v * 100)
+
+    sliders = [
+        ("Hue", hue_var, 0, 360, "#f38ba8"),
+        ("Sat", sat_var, 0, 100, "#a6e3a1"),
+        ("Val", val_var, 0, 100, "#89b4fa"),
+    ]
+
+    for label_text, var, from_, to, color in sliders:
+        row = tk.Frame(slider_frame, bg=BG_DARK)
+        row.pack(fill=tk.X, pady=3)
+
+        lbl = tk.Label(row, text=label_text, fg=color, bg=BG_DARK, font=("Sans", 9), width=4, anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+
+        slider = ttk.Scale(
+            row,
+            from_=from_,
+            to=to,
+            variable=var,
+            orient=tk.HORIZONTAL,
+            style="Custom.Horizontal.TScale",
+            command=on_slider_change
+        )
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
+
+        val_lbl = tk.Label(row, textvariable=var, fg=FG_DIM, bg=BG_DARK, font=("Sans", 8), width=5)
+        val_lbl.pack(side=tk.LEFT)
+
+    # Preset colors label
+    preset_label = tk.Label(
+        right_frame,
+        text="Presets",
+        fg=FG_DIM,
+        bg=BG_DARK,
+        font=("Sans", 9)
+    )
+    preset_label.pack(anchor=tk.W)
+
+    # Preset color grid
+    preset_frame = tk.Frame(right_frame, bg=BG_DARK)
+    preset_frame.pack(fill=tk.X, pady=(5, 10))
+
+    for i, color in enumerate(PRESETS):
+        btn = tk.Button(
+            preset_frame,
+            bg=color,
+            activebackground=color,
+            width=2,
+            height=1,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=lambda c=color: on_preset_click(c)
+        )
+        btn.grid(row=i // 8, column=i % 8, padx=1, pady=1)
+
+    # Random button
     random_btn = tk.Button(
-        btn_frame,
-        text="Random",
-        command=random_color,
-        bg="#f5c2e7",
-        fg="#1e1e2e",
-        font=("Sans", 10),
-        padx=15,
-        pady=5
+        right_frame,
+        text="🎲 Random",
+        command=on_random,
+        bg=BG_MID,
+        fg=FG_TEXT,
+        activebackground=BG_LIGHT,
+        activeforeground=FG_TEXT,
+        font=("Sans", 9),
+        relief=tk.FLAT,
+        cursor="hand2",
+        padx=10,
+        pady=3
     )
-    random_btn.pack(side=tk.LEFT, padx=5)
+    random_btn.pack(anchor=tk.W, pady=(5, 0))
 
-    # Confirm/Cancel buttons
-    action_frame = tk.Frame(root, bg="#1e1e2e")
-    action_frame.pack(pady=10)
+    # Bottom buttons
+    btn_frame = tk.Frame(main_frame, bg=BG_DARK)
+    btn_frame.pack(fill=tk.X, pady=(15, 0))
 
-    confirm_btn = tk.Button(
-        action_frame,
+    cancel_btn = tk.Button(
+        btn_frame,
+        text="Cancel",
+        command=cancel,
+        bg=BG_MID,
+        fg=FG_TEXT,
+        activebackground=BG_LIGHT,
+        activeforeground=FG_TEXT,
+        font=("Sans", 10),
+        relief=tk.FLAT,
+        padx=20,
+        pady=6,
+        cursor="hand2"
+    )
+    cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
+
+    apply_btn = tk.Button(
+        btn_frame,
         text="Apply",
         command=confirm,
         bg="#a6e3a1",
-        fg="#1e1e2e",
+        fg=BG_DARK,
+        activebackground="#94d990",
+        activeforeground=BG_DARK,
         font=("Sans", 10, "bold"),
+        relief=tk.FLAT,
         padx=20,
-        pady=5
+        pady=6,
+        cursor="hand2"
     )
-    confirm_btn.pack(side=tk.LEFT, padx=10)
+    apply_btn.pack(side=tk.RIGHT)
 
-    cancel_btn = tk.Button(
-        action_frame,
-        text="Cancel",
-        command=cancel,
-        bg="#f38ba8",
-        fg="#1e1e2e",
-        font=("Sans", 10),
-        padx=20,
-        pady=5
-    )
-    cancel_btn.pack(side=tk.LEFT, padx=10)
+    # Initialize preview
+    outline = ensure_contrast(initial_color, BG_DARK)
+    draw_cursor(initial_color, outline)
 
-    # Center window on screen
+    # Center window
     root.update_idletasks()
-    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-    y = (root.winfo_screenheight() - root.winfo_height()) // 2
+    w, h = root.winfo_width(), root.winfo_height()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"+{x}+{y}")
+
+    # Handle window close
+    root.protocol("WM_DELETE_WINDOW", cancel)
 
     root.mainloop()
 
