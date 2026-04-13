@@ -14,6 +14,7 @@ Usage:
     omarchy-sync-cursor <theme> --base-color "#ff00ff"   # Override base color
     omarchy-sync-cursor --color-only --base-color "#ff00ff"  # No theme needed
     omarchy-sync-cursor --random               # Random vibrant color
+    omarchy-sync-cursor --picker               # GUI color picker
 """
 
 import os
@@ -250,6 +251,172 @@ def generate_random_vibrant_color() -> str:
 
     r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
     return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
+
+def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
+    """Open a GUI color picker dialog with live preview swatch.
+
+    Args:
+        initial_color: Starting color in hex format
+
+    Returns:
+        Selected color in hex format, or None if cancelled
+    """
+    try:
+        import tkinter as tk
+        from tkinter import colorchooser
+    except ImportError:
+        raise RuntimeError("tkinter is required for --picker. Install python-tk package.")
+
+    # Normalize initial color
+    try:
+        initial_color = validate_hex_color(initial_color)
+    except ValueError:
+        initial_color = "#ff00ff"
+
+    root = tk.Tk()
+    root.title("Cursor Color Picker")
+    root.geometry("400x300")
+    root.configure(bg="#1e1e2e")
+
+    selected_color = [None]  # Use list to allow modification in nested function
+
+    # Title
+    title = tk.Label(
+        root,
+        text="Choose Cursor Color",
+        font=("Sans", 16, "bold"),
+        fg="#cdd6f4",
+        bg="#1e1e2e"
+    )
+    title.pack(pady=20)
+
+    # Preview frame
+    preview_frame = tk.Frame(root, bg="#1e1e2e")
+    preview_frame.pack(pady=10)
+
+    # Color preview swatch
+    preview_label = tk.Label(
+        preview_frame,
+        text="Preview",
+        fg="#cdd6f4",
+        bg="#1e1e2e"
+    )
+    preview_label.pack()
+
+    color_swatch = tk.Canvas(
+        preview_frame,
+        width=120,
+        height=80,
+        bg=initial_color,
+        highlightthickness=2,
+        highlightbackground="#45475a"
+    )
+    color_swatch.pack(pady=5)
+
+    # Hex value display
+    hex_var = tk.StringVar(value=initial_color)
+    hex_label = tk.Label(
+        preview_frame,
+        textvariable=hex_var,
+        font=("Monospace", 12),
+        fg="#a6e3a1",
+        bg="#1e1e2e"
+    )
+    hex_label.pack()
+
+    current_color = [initial_color]
+
+    def pick_color():
+        # Open the color chooser
+        color = colorchooser.askcolor(
+            color=current_color[0],
+            title="Select Cursor Color"
+        )
+        if color[1]:  # color is ((r,g,b), "#hexcode")
+            current_color[0] = color[1]
+            color_swatch.configure(bg=color[1])
+            hex_var.set(color[1])
+
+    def confirm():
+        selected_color[0] = current_color[0]
+        root.quit()
+        root.destroy()
+
+    def cancel():
+        root.quit()
+        root.destroy()
+
+    def random_color():
+        new_color = generate_random_vibrant_color()
+        current_color[0] = new_color
+        color_swatch.configure(bg=new_color)
+        hex_var.set(new_color)
+
+    # Buttons frame
+    btn_frame = tk.Frame(root, bg="#1e1e2e")
+    btn_frame.pack(pady=20)
+
+    pick_btn = tk.Button(
+        btn_frame,
+        text="Pick Color",
+        command=pick_color,
+        bg="#89b4fa",
+        fg="#1e1e2e",
+        font=("Sans", 10),
+        padx=15,
+        pady=5
+    )
+    pick_btn.pack(side=tk.LEFT, padx=5)
+
+    random_btn = tk.Button(
+        btn_frame,
+        text="Random",
+        command=random_color,
+        bg="#f5c2e7",
+        fg="#1e1e2e",
+        font=("Sans", 10),
+        padx=15,
+        pady=5
+    )
+    random_btn.pack(side=tk.LEFT, padx=5)
+
+    # Confirm/Cancel buttons
+    action_frame = tk.Frame(root, bg="#1e1e2e")
+    action_frame.pack(pady=10)
+
+    confirm_btn = tk.Button(
+        action_frame,
+        text="Apply",
+        command=confirm,
+        bg="#a6e3a1",
+        fg="#1e1e2e",
+        font=("Sans", 10, "bold"),
+        padx=20,
+        pady=5
+    )
+    confirm_btn.pack(side=tk.LEFT, padx=10)
+
+    cancel_btn = tk.Button(
+        action_frame,
+        text="Cancel",
+        command=cancel,
+        bg="#f38ba8",
+        fg="#1e1e2e",
+        font=("Sans", 10),
+        padx=20,
+        pady=5
+    )
+    cancel_btn.pack(side=tk.LEFT, padx=10)
+
+    # Center window on screen
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 2
+    root.geometry(f"+{x}+{y}")
+
+    root.mainloop()
+
+    return selected_color[0]
 
 # ============================================================================
 # Theme Color Parsing
@@ -775,6 +942,11 @@ def main():
         action="store_true",
         help="Generate a random vibrant cursor color"
     )
+    parser.add_argument(
+        "--picker",
+        action="store_true",
+        help="Open GUI color picker to select cursor color"
+    )
 
     args = parser.parse_args()
 
@@ -798,13 +970,28 @@ def main():
         logger.error(str(e))
         sys.exit(1)
 
-    # Handle --color-only or --random mode (no theme required)
-    color_only_mode = args.color_only or args.random
+    # Handle --picker mode: open GUI color picker
+    if args.picker:
+        try:
+            initial = cli_base_color or "#ff00ff"
+            picked_color = open_color_picker(initial)
+            if picked_color:
+                cli_base_color = picked_color
+                logger.info(f"Selected color: {picked_color}")
+            else:
+                logger.info("Color picker cancelled")
+                sys.exit(0)
+        except RuntimeError as e:
+            logger.error(str(e))
+            sys.exit(1)
+
+    # Handle --color-only or --random or --picker mode (no theme required)
+    color_only_mode = args.color_only or args.random or args.picker
 
     if color_only_mode:
-        # In color-only mode, we need at least --base-color or --random
-        if not args.random and not cli_base_color:
-            logger.error("--color-only requires --base-color or --random")
+        # In color-only mode, we need at least --base-color, --random, or --picker
+        if not args.random and not args.picker and not cli_base_color:
+            logger.error("--color-only requires --base-color, --random, or --picker")
             sys.exit(1)
 
         # Generate random color if requested
