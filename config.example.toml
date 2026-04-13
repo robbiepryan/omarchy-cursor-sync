@@ -44,3 +44,17 @@ outline_color_source = "background"
 # Watch background color: Background for loading/wait cursor animations
 # Options: "selection_background", "background", "black", "auto_darken"
 watch_color_source = "background"
+
+[color_override]
+# Persistent color overrides (leave empty to use automatic selection from theme)
+# These take precedence over auto-computed colors but can be overridden by CLI args
+# Use hex format: "#ff00ff" or "#f0f"
+
+# Override cursor fill color
+base_color = ""
+
+# Override cursor outline color
+outline_color = ""
+
+# Override loading animation background color
+watch_color = ""

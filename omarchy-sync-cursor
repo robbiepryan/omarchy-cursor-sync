@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Omarchy Cursor Sync - Automatically build and apply Bibata cursors matching theme colors.
+Omarchy Cursor Sync - Build and apply Bibata cursors matching theme colors.
 
 This script:
 1. Reads colors from the current Omarchy theme's alacritty.toml
@@ -10,7 +10,10 @@ This script:
 
 Usage:
     omarchy-sync-cursor <theme_name>
-    omarchy-sync-cursor --current     # Uses currently active theme
+    omarchy-sync-cursor --current              # Uses currently active theme
+    omarchy-sync-cursor <theme> --base-color "#ff00ff"   # Override base color
+    omarchy-sync-cursor --color-only --base-color "#ff00ff"  # No theme needed
+    omarchy-sync-cursor --random               # Random vibrant color
 """
 
 import os
@@ -21,6 +24,9 @@ import json
 import shutil
 import argparse
 import logging
+import random
+import colorsys
+import re
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple
@@ -52,11 +58,15 @@ class Config:
     outline_color_source: str
     watch_color_source: str
     venv_path: Path
+    # Color overrides (empty string means use auto)
+    override_base_color: str
+    override_outline_color: str
+    override_watch_color: str
 
 def load_config() -> Config:
     """Load configuration from config.toml or use defaults."""
     config_path = Path.home() / ".config" / "bibata-omarchy-sync" / "config.toml"
-    
+
     # Defaults
     defaults = {
         "bibata_source_dir": Path.home() / "src" / "Bibata_Cursor",
@@ -72,8 +82,11 @@ def load_config() -> Config:
         "outline_color_source": "background",
         "watch_color_source": "background",
         "venv_path": Path.home() / ".local" / "bibata-venv",
+        "override_base_color": "",
+        "override_outline_color": "",
+        "override_watch_color": "",
     }
-    
+
     if config_path.exists() and HAS_TOML:
         try:
             data = toml.load(config_path)
@@ -81,10 +94,11 @@ def load_config() -> Config:
             cursor = data.get("cursor", {})
             hyprland = data.get("hyprland", {})
             color_mapping = data.get("color_mapping", {})
-            
+            color_override = data.get("color_override", {})
+
             def expand_path(p: str) -> Path:
                 return Path(os.path.expanduser(p))
-            
+
             return Config(
                 bibata_source_dir=expand_path(paths.get("bibata_source_dir", str(defaults["bibata_source_dir"]))),
                 cache_dir=expand_path(paths.get("cache_dir", str(defaults["cache_dir"]))),
@@ -99,10 +113,13 @@ def load_config() -> Config:
                 outline_color_source=color_mapping.get("outline_color_source", defaults["outline_color_source"]),
                 watch_color_source=color_mapping.get("watch_color_source", defaults["watch_color_source"]),
                 venv_path=defaults["venv_path"],
+                override_base_color=color_override.get("base_color", defaults["override_base_color"]),
+                override_outline_color=color_override.get("outline_color", defaults["override_outline_color"]),
+                override_watch_color=color_override.get("watch_color", defaults["override_watch_color"]),
             )
         except Exception as e:
             logging.warning(f"Error loading config: {e}, using defaults")
-    
+
     return Config(**defaults)
 
 # ============================================================================
@@ -172,7 +189,7 @@ def ensure_contrast(base: str, outline: str, min_ratio: float = 3.0) -> str:
     """Adjust outline color to ensure minimum contrast with base."""
     if contrast_ratio(base, outline) >= min_ratio:
         return outline
-    
+
     # If base is light, make outline darker; otherwise lighter
     if is_light_color(base):
         adjusted = outline
@@ -188,6 +205,51 @@ def ensure_contrast(base: str, outline: str, min_ratio: float = 3.0) -> str:
             if contrast_ratio(base, adjusted) >= min_ratio:
                 return adjusted
         return "#ffffff"
+
+def validate_hex_color(color: str) -> str:
+    """Validate and normalize hex color to #RRGGBB format.
+
+    Args:
+        color: Hex color string (#RGB or #RRGGBB)
+
+    Returns:
+        Normalized #RRGGBB format
+
+    Raises:
+        ValueError: If color format is invalid
+    """
+    color = color.strip()
+
+    # Match #RGB or #RRGGBB
+    match = re.match(r'^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$', color)
+    if not match:
+        raise ValueError(f"Invalid hex color: '{color}'. Use format #RGB or #RRGGBB (e.g., #ff00ff)")
+
+    hex_part = match.group(1)
+
+    # Expand #RGB to #RRGGBB
+    if len(hex_part) == 3:
+        hex_part = ''.join(c * 2 for c in hex_part)
+
+    return f"#{hex_part.lower()}"
+
+def generate_random_vibrant_color() -> str:
+    """Generate a random vibrant, saturated color suitable for a cursor.
+
+    Uses HSV color space to ensure the color is always visually striking:
+    - Random hue (0-360)
+    - High saturation (0.7-1.0)
+    - Medium-high value (0.6-0.9)
+
+    Returns:
+        Hex color string in #RRGGBB format
+    """
+    hue = random.random()  # 0-1
+    saturation = 0.7 + random.random() * 0.3  # 0.7-1.0
+    value = 0.6 + random.random() * 0.3  # 0.6-0.9
+
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+    return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
 
 # ============================================================================
 # Theme Color Parsing
@@ -688,69 +750,197 @@ def main():
         action="store_true",
         help="Show what would be done without making changes"
     )
-    
+    parser.add_argument(
+        "--base-color",
+        metavar="HEX",
+        help="Override cursor fill color (e.g., #ff00ff)"
+    )
+    parser.add_argument(
+        "--outline-color",
+        metavar="HEX",
+        help="Override cursor outline color (e.g., #000000)"
+    )
+    parser.add_argument(
+        "--watch-color",
+        metavar="HEX",
+        help="Override loading animation background color"
+    )
+    parser.add_argument(
+        "--color-only",
+        action="store_true",
+        help="Use explicit colors without requiring a theme"
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Generate a random vibrant cursor color"
+    )
+
     args = parser.parse_args()
-    
+
     # Load configuration
     config = load_config()
     logger = setup_logging(config)
-    
-    # Determine theme name
-    if args.current:
-        theme_name = get_current_theme()
-        if not theme_name:
-            logger.error("Could not determine current theme. Please specify theme name.")
-            sys.exit(1)
-    elif args.theme:
-        theme_name = args.theme
-    else:
-        parser.print_help()
-        sys.exit(1)
-    
-    logger.info(f"Syncing cursor for theme: {theme_name}")
-    
-    # Resolve theme path
-    theme_path = config.themes_dir / theme_name
-    if not theme_path.exists():
-        logger.error(f"Theme not found: {theme_path}")
-        sys.exit(1)
-    
-    cursor_theme_name = get_cursor_theme_name(theme_name)
-    
+
+    # Validate color arguments if provided
+    cli_base_color = None
+    cli_outline_color = None
+    cli_watch_color = None
+
     try:
-        # Extract colors
-        logger.info("Extracting theme colors...")
-        colors = extract_theme_colors(theme_path, config.color_source)
-        
-        # Compute cursor colors
-        base_color, outline_color, watch_color = compute_cursor_colors(colors, config)
-        logger.info(f"Computed cursor colors:")
+        if args.base_color:
+            cli_base_color = validate_hex_color(args.base_color)
+        if args.outline_color:
+            cli_outline_color = validate_hex_color(args.outline_color)
+        if args.watch_color:
+            cli_watch_color = validate_hex_color(args.watch_color)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    # Handle --color-only or --random mode (no theme required)
+    color_only_mode = args.color_only or args.random
+
+    if color_only_mode:
+        # In color-only mode, we need at least --base-color or --random
+        if not args.random and not cli_base_color:
+            logger.error("--color-only requires --base-color or --random")
+            sys.exit(1)
+
+        # Generate random color if requested
+        if args.random:
+            random_color = generate_random_vibrant_color()
+            logger.info(f"Generated random color: {random_color}")
+            if not cli_base_color:
+                cli_base_color = random_color
+
+        # Create a custom theme name from colors
+        color_hash = hashlib.sha256(cli_base_color.encode()).hexdigest()[:8]
+        theme_name = f"custom-{color_hash}"
+        theme_path = None  # No theme path needed
+
+        # Default colors for outline and watch if not specified
+        base_color = cli_base_color.upper()
+        outline_color = cli_outline_color.upper() if cli_outline_color else ensure_contrast(base_color, "#1e1e2e").upper()
+        watch_color = cli_watch_color.upper() if cli_watch_color else darken_color(outline_color, 0.2).upper()
+
+        cursor_theme_name = get_cursor_theme_name(theme_name)
+        logger.info(f"Building custom cursor with colors:")
         logger.info(f"  Base:    {base_color}")
         logger.info(f"  Outline: {outline_color}")
         logger.info(f"  Watch:   {watch_color}")
-        
-        if args.dry_run:
-            logger.info("Dry run - no changes made")
-            sys.exit(0)
-        
-        # Check cache
-        theme_hash = get_theme_hash(theme_path, config.color_source)
-        if not args.force and check_cache(config, theme_name, theme_hash):
-            logger.info("Using cached cursor theme (colors unchanged)")
+
+    else:
+        # Standard theme-based mode
+        # Determine theme name
+        if args.current:
+            theme_name = get_current_theme()
+            if not theme_name:
+                logger.error("Could not determine current theme. Please specify theme name.")
+                sys.exit(1)
+        elif args.theme:
+            theme_name = args.theme
         else:
-            # Build cursor theme
+            parser.print_help()
+            sys.exit(1)
+
+        logger.info(f"Syncing cursor for theme: {theme_name}")
+
+        # Resolve theme path
+        theme_path = config.themes_dir / theme_name
+        if not theme_path.exists():
+            logger.error(f"Theme not found: {theme_path}")
+            sys.exit(1)
+
+        cursor_theme_name = get_cursor_theme_name(theme_name)
+
+        # Extract colors from theme
+        logger.info("Extracting theme colors...")
+        colors = extract_theme_colors(theme_path, config.color_source)
+
+        # Compute cursor colors from theme
+        base_color, outline_color, watch_color = compute_cursor_colors(colors, config)
+
+        # Apply overrides: CLI args > config file > auto-computed
+        # Config file overrides
+        if config.override_base_color:
+            try:
+                base_color = validate_hex_color(config.override_base_color).upper()
+            except ValueError:
+                logger.warning(f"Invalid base_color in config: {config.override_base_color}, using auto")
+        if config.override_outline_color:
+            try:
+                outline_color = validate_hex_color(config.override_outline_color).upper()
+            except ValueError:
+                logger.warning(f"Invalid outline_color in config: {config.override_outline_color}, using auto")
+        if config.override_watch_color:
+            try:
+                watch_color = validate_hex_color(config.override_watch_color).upper()
+            except ValueError:
+                logger.warning(f"Invalid watch_color in config: {config.override_watch_color}, using auto")
+
+        # CLI overrides (highest priority)
+        if cli_base_color:
+            base_color = cli_base_color.upper()
+        if cli_outline_color:
+            outline_color = cli_outline_color.upper()
+        if cli_watch_color:
+            watch_color = cli_watch_color.upper()
+
+        # Handle --random with a theme (overrides base color only)
+        if args.random:
+            base_color = generate_random_vibrant_color().upper()
+            logger.info(f"Generated random base color: {base_color}")
+
+        logger.info(f"Final cursor colors:")
+        logger.info(f"  Base:    {base_color}")
+        logger.info(f"  Outline: {outline_color}")
+        logger.info(f"  Watch:   {watch_color}")
+
+    if args.dry_run:
+        logger.info("Dry run - no changes made")
+        sys.exit(0)
+
+    try:
+        # Check cache (only for theme-based builds with no CLI overrides)
+        use_cache = (
+            theme_path is not None
+            and not args.force
+            and not cli_base_color
+            and not cli_outline_color
+            and not cli_watch_color
+            and not args.random
+        )
+
+        if use_cache:
+            theme_hash = get_theme_hash(theme_path, config.color_source)
+            if check_cache(config, theme_name, theme_hash):
+                logger.info("Using cached cursor theme (colors unchanged)")
+            else:
+                # Build cursor theme
+                logger.info("Building cursor theme...")
+                theme_src = build_cursor_theme(
+                    config, theme_name,
+                    base_color, outline_color, watch_color,
+                    logger
+                )
+
+                # Install
+                install_cursor_theme(config, theme_src, cursor_theme_name, logger)
+
+                # Update cache
+                update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
+        else:
+            # Always build for custom colors or forced rebuild
             logger.info("Building cursor theme...")
             theme_src = build_cursor_theme(
                 config, theme_name,
                 base_color, outline_color, watch_color,
                 logger
             )
-            
+
             # Install
             install_cursor_theme(config, theme_src, cursor_theme_name, logger)
-            
-            # Update cache
-            update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
         
         # Apply cursor
         apply_cursor_hyprland(cursor_theme_name, config.cursor_size, logger)
