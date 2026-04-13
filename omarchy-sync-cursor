@@ -793,6 +793,44 @@ def get_cursor_theme_name(theme_name: str) -> str:
     safe_name = "".join(c if c.isalnum() or c in "-_" else "-" for c in theme_name)
     return f"Bibata-Omarchy-{safe_name}"
 
+def get_color_hash(base: str, outline: str, watch: str) -> str:
+    """Generate a hash from cursor colors for caching."""
+    color_str = f"{base.lower()}{outline.lower()}{watch.lower()}"
+    return hashlib.sha256(color_str.encode()).hexdigest()[:12]
+
+def check_color_cache(config: Config, color_hash: str) -> Optional[str]:
+    """Check if a cursor theme with these exact colors exists."""
+    cache_meta = config.cache_dir / "color-cache.json"
+    if not cache_meta.exists():
+        return None
+    try:
+        with open(cache_meta) as f:
+            cache = json.load(f)
+        theme_name = cache.get(color_hash)
+        if theme_name and (config.icons_dir / theme_name).exists():
+            return theme_name
+    except Exception:
+        pass
+    return None
+
+def update_color_cache(config: Config, color_hash: str, cursor_theme_name: str):
+    """Store color->theme mapping for instant reuse."""
+    cache_meta = config.cache_dir / "color-cache.json"
+    config.cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache = {}
+        if cache_meta.exists():
+            with open(cache_meta) as f:
+                cache = json.load(f)
+        cache[color_hash] = cursor_theme_name
+        # Keep only last 20 entries to avoid bloat
+        if len(cache) > 20:
+            cache = dict(list(cache.items())[-20:])
+        with open(cache_meta, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
 def check_cache(config: Config, theme_name: str, theme_hash: str) -> bool:
     """Check if a valid cached cursor theme exists."""
     cursor_theme_name = get_cursor_theme_name(theme_name)
@@ -851,7 +889,8 @@ def build_cursor_theme(
     
     # Step 1: Run cbmp to render SVGs to PNGs
     logger.info(f"Rendering cursor bitmaps with colors: base={base_color}, outline={outline_color}, watch={watch_color}")
-    
+    logger.info("  [1/2] Rendering SVGs to bitmaps (this takes ~10-15s)...")
+
     cbmp_cmd = [
         "npx", "cbmp",
         "-d", str(svg_dir),
@@ -860,33 +899,46 @@ def build_cursor_theme(
         "-oc", outline_color,
         "-wc", watch_color
     ]
-    
-    result = subprocess.run(
+
+    # Run with real-time output for progress indication
+    process = subprocess.Popen(
         cbmp_cmd,
         cwd=config.bibata_source_dir,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True
     )
-    
-    if result.returncode != 0:
-        logger.error(f"cbmp failed: {result.stderr}")
-        raise RuntimeError(f"cbmp failed: {result.stderr}")
-    
-    logger.info("Bitmap rendering complete")
+
+    # Stream output to show progress
+    output_lines = []
+    for line in process.stdout:
+        output_lines.append(line)
+        # Show dots for progress without flooding logs
+        if len(output_lines) % 20 == 0:
+            print(".", end="", flush=True)
+    print()  # newline after dots
+
+    process.wait()
+
+    if process.returncode != 0:
+        logger.error(f"cbmp failed: {''.join(output_lines)}")
+        raise RuntimeError(f"cbmp failed")
+
+    logger.info("  Bitmap rendering complete")
     
     # Step 2: Run ctgen to build cursor theme
-    logger.info(f"Building cursor theme: {cursor_theme_name}")
-    
+    logger.info(f"  [2/2] Building cursor package: {cursor_theme_name} (~5s)...")
+
     # Find build.toml - check configs directory first
     build_toml = config.bibata_source_dir / "configs" / "normal" / "x.build.toml"
     if not build_toml.exists():
         build_toml = config.bibata_source_dir / "build.toml"
-    
+
     if not build_toml.exists():
         raise FileNotFoundError(f"build.toml not found in {config.bibata_source_dir}")
-    
+
     ctgen_path = config.venv_path / "bin" / "ctgen"
-    
+
     ctgen_cmd = [
         str(ctgen_path),
         str(build_toml),
@@ -894,19 +946,29 @@ def build_cursor_theme(
         "-n", cursor_theme_name,
         "-c", f"Omarchy {theme_name} Bibata cursor theme"
     ]
-    
-    result = subprocess.run(
+
+    process = subprocess.Popen(
         ctgen_cmd,
         cwd=config.bibata_source_dir,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True
     )
-    
-    if result.returncode != 0:
-        logger.error(f"ctgen failed: {result.stderr}")
-        raise RuntimeError(f"ctgen failed: {result.stderr}")
-    
-    logger.info("Cursor theme build complete")
+
+    output_lines = []
+    for line in process.stdout:
+        output_lines.append(line)
+        if len(output_lines) % 10 == 0:
+            print(".", end="", flush=True)
+    print()
+
+    process.wait()
+
+    if process.returncode != 0:
+        logger.error(f"ctgen failed: {''.join(output_lines)}")
+        raise RuntimeError(f"ctgen failed")
+
+    logger.info("  Cursor theme build complete")
     
     # Find built theme
     theme_src = config.bibata_source_dir / "themes" / cursor_theme_name
@@ -1262,22 +1324,45 @@ def main():
         sys.exit(0)
 
     try:
-        # Check cache (only for theme-based builds with no CLI overrides)
-        use_cache = (
-            theme_path is not None
-            and not args.force
-            and not cli_base_color
-            and not cli_outline_color
-            and not cli_watch_color
-            and not args.random
-        )
+        # First: check color-based cache (works for any color combo)
+        color_hash = get_color_hash(base_color, outline_color, watch_color)
+        cached_theme = check_color_cache(config, color_hash) if not args.force else None
 
-        if use_cache:
-            theme_hash = get_theme_hash(theme_path, config.color_source)
-            if check_cache(config, theme_name, theme_hash):
-                logger.info("Using cached cursor theme (colors unchanged)")
+        if cached_theme:
+            logger.info(f"Using color-cached theme: {cached_theme} (instant)")
+            cursor_theme_name = cached_theme
+        else:
+            # Check theme-based cache (only for theme-based builds with no CLI overrides)
+            use_theme_cache = (
+                theme_path is not None
+                and not args.force
+                and not cli_base_color
+                and not cli_outline_color
+                and not cli_watch_color
+                and not args.random
+            )
+
+            if use_theme_cache:
+                theme_hash = get_theme_hash(theme_path, config.color_source)
+                if check_cache(config, theme_name, theme_hash):
+                    logger.info("Using cached cursor theme (colors unchanged)")
+                else:
+                    # Build cursor theme
+                    logger.info("Building cursor theme...")
+                    theme_src = build_cursor_theme(
+                        config, theme_name,
+                        base_color, outline_color, watch_color,
+                        logger
+                    )
+
+                    # Install
+                    install_cursor_theme(config, theme_src, cursor_theme_name, logger)
+
+                    # Update both caches
+                    update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
+                    update_color_cache(config, color_hash, cursor_theme_name)
             else:
-                # Build cursor theme
+                # Build for custom colors or forced rebuild
                 logger.info("Building cursor theme...")
                 theme_src = build_cursor_theme(
                     config, theme_name,
@@ -1288,19 +1373,8 @@ def main():
                 # Install
                 install_cursor_theme(config, theme_src, cursor_theme_name, logger)
 
-                # Update cache
-                update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
-        else:
-            # Always build for custom colors or forced rebuild
-            logger.info("Building cursor theme...")
-            theme_src = build_cursor_theme(
-                config, theme_name,
-                base_color, outline_color, watch_color,
-                logger
-            )
-
-            # Install
-            install_cursor_theme(config, theme_src, cursor_theme_name, logger)
+                # Update color cache
+                update_color_cache(config, color_hash, cursor_theme_name)
         
         # Apply cursor
         apply_cursor_hyprland(cursor_theme_name, config.cursor_size, logger)
