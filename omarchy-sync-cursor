@@ -28,6 +28,7 @@ import logging
 import random
 import colorsys
 import re
+import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple
@@ -42,6 +43,14 @@ except ImportError:
 # ============================================================================
 # Configuration
 # ============================================================================
+
+@dataclass
+class TransparencyPreset:
+    """Transparency preset definition."""
+    name: str  # "glass", "shadow", "neon", "classic"
+    base_opacity: float  # 0.0-1.0
+    outline_opacity: float  # 0.0-1.0
+    watch_opacity: float  # 0.0-1.0
 
 @dataclass
 class Config:
@@ -63,6 +72,8 @@ class Config:
     override_base_color: str
     override_outline_color: str
     override_watch_color: str
+    # Transparency settings
+    transparency_preset: str  # "auto", "glass", "shadow", "neon", "classic"
 
 def load_config() -> Config:
     """Load configuration from config.toml or use defaults."""
@@ -86,6 +97,7 @@ def load_config() -> Config:
         "override_base_color": "",
         "override_outline_color": "",
         "override_watch_color": "",
+        "transparency_preset": "auto",
     }
 
     if config_path.exists() and HAS_TOML:
@@ -96,6 +108,7 @@ def load_config() -> Config:
             hyprland = data.get("hyprland", {})
             color_mapping = data.get("color_mapping", {})
             color_override = data.get("color_override", {})
+            transparency = data.get("transparency", {})
 
             def expand_path(p: str) -> Path:
                 return Path(os.path.expanduser(p))
@@ -117,6 +130,7 @@ def load_config() -> Config:
                 override_base_color=color_override.get("base_color", defaults["override_base_color"]),
                 override_outline_color=color_override.get("outline_color", defaults["override_outline_color"]),
                 override_watch_color=color_override.get("watch_color", defaults["override_watch_color"]),
+                transparency_preset=transparency.get("preset", defaults["transparency_preset"]),
             )
         except Exception as e:
             logging.warning(f"Error loading config: {e}, using defaults")
@@ -186,6 +200,131 @@ def is_vibrant(hex_color: str, min_saturation: float = 0.3) -> bool:
     """Check if a color is vibrant enough to be visually interesting."""
     return get_saturation(hex_color) >= min_saturation
 
+# ============================================================================
+# Transparency Presets
+# ============================================================================
+
+def analyze_theme_properties(colors: Dict[str, str]) -> Dict:
+    """Detect theme properties to inform transparency selection."""
+    background = colors.get("background", "#1e1e2e")
+    foreground = colors.get("foreground", "#cdd6f4")
+
+    luminance_bg = relative_luminance(background)
+    luminance_fg = relative_luminance(foreground)
+    saturation_bg = get_saturation(background)
+    contrast = contrast_ratio(foreground, background)
+
+    return {
+        "is_light_theme": luminance_bg > 0.6,
+        "bg_luminance": luminance_bg,
+        "fg_luminance": luminance_fg,
+        "bg_saturation": saturation_bg,
+        "contrast_ratio": contrast,
+        "is_high_contrast": contrast > 7.0,
+        "is_vibrant": saturation_bg > 0.3,
+    }
+
+TRANSPARENCY_PRESETS = {
+    "glass": TransparencyPreset("glass", 0.75, 0.85, 0.70),
+    "shadow": TransparencyPreset("shadow", 0.95, 1.0, 0.90),
+    "neon": TransparencyPreset("neon", 0.60, 0.75, 0.55),
+    "classic": TransparencyPreset("classic", 1.0, 1.0, 1.0),
+}
+
+def select_transparency_preset(theme_props: Dict, override: Optional[str] = None) -> TransparencyPreset:
+    """Select transparency preset based on theme properties.
+
+    Args:
+        theme_props: Dictionary from analyze_theme_properties()
+        override: Manual override ("glass", "shadow", "neon", "classic", or None/"auto")
+
+    Returns:
+        TransparencyPreset dataclass with opacity values
+    """
+    # Explicit user choice always wins (not "auto", not None)
+    if override and override != "auto" and override in TRANSPARENCY_PRESETS:
+        return TRANSPARENCY_PRESETS[override]
+
+    # Auto-selection: light themes default to classic
+    if theme_props.get("is_light_theme"):
+        preset_name = "classic"
+    # Dark + vibrant background (saturation > 0.5) -> NEON
+    elif theme_props.get("bg_saturation", 0) > 0.5:
+        preset_name = "neon"
+    # Dark themes -> GLASS
+    else:
+        preset_name = "glass"
+
+    return TRANSPARENCY_PRESETS[preset_name]
+
+def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
+    """Apply transparency to SVG files by modifying opacity attributes.
+
+    Creates a temporary copy of the SVG directory with opacity modifications.
+    If preset is fully opaque (all 1.0), returns original directory.
+    Caller must clean up the returned temp directory when done.
+
+    Args:
+        svg_dir: Path to SVG source directory
+        preset: TransparencyPreset with opacity values
+
+    Returns:
+        Path to SVG directory (original if opaque, or modified temp copy)
+    """
+    import xml.etree.ElementTree as ET
+
+    # If fully opaque, skip modification
+    if preset.base_opacity >= 1.0 and preset.outline_opacity >= 1.0 and preset.watch_opacity >= 1.0:
+        return svg_dir
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="svg-transparency-"))
+
+    try:
+        for svg_file in svg_dir.glob("**/*.svg"):
+            rel_path = svg_file.relative_to(svg_dir)
+            dest_file = temp_dir / rel_path
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                tree = ET.parse(svg_file)
+                root = tree.getroot()
+
+                ET.register_namespace('', 'http://www.w3.org/2000/svg')
+
+                for elem in root.iter():
+                    if elem.tag.endswith('}path') or elem.tag == 'path':
+                        elem_class = elem.get('class', '')
+                        elem_id = elem.get('id', '')
+
+                        if 'outline' in elem_class or 'outline' in elem_id or elem.get('stroke'):
+                            opacity = preset.outline_opacity
+                        elif 'watch' in elem_class or 'watch' in elem_id:
+                            opacity = preset.watch_opacity
+                        else:
+                            opacity = preset.base_opacity
+
+                        if not elem.get('opacity'):
+                            elem.set('opacity', str(opacity))
+
+                    elif elem.tag.endswith('}g') or elem.tag == 'g':
+                        elem_class = elem.get('class', '')
+                        if 'outline' in elem_class:
+                            elem.set('opacity', str(preset.outline_opacity))
+                        elif 'watch' in elem_class:
+                            elem.set('opacity', str(preset.watch_opacity))
+                        elif 'base' in elem_class or 'fill' in elem_class:
+                            elem.set('opacity', str(preset.base_opacity))
+
+                tree.write(dest_file, encoding='utf-8', xml_declaration=True)
+            except Exception:
+                shutil.copy2(svg_file, dest_file)
+
+        return temp_dir
+    except Exception:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        return svg_dir
+
 def ensure_contrast(base: str, outline: str, min_ratio: float = 3.0) -> str:
     """Adjust outline color to ensure minimum contrast with base."""
     if contrast_ratio(base, outline) >= min_ratio:
@@ -252,101 +391,336 @@ def generate_random_vibrant_color() -> str:
     r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
     return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
 
-def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
-    """Open an advanced GUI color picker with cursor preview, HSV sliders, and presets.
+def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_preset: str = "auto") -> Optional[Dict]:
+    """Open a glassmorphic color picker with cursor preview, presets, and transparency options.
+
+    Features a midnight glass aesthetic with floating frosted panels,
+    electric cyan accents, persistent preset storage, and transparency preset selector.
 
     Args:
         initial_color: Starting color in hex format
+        initial_transparency_preset: Starting transparency preset (auto, glass, shadow, neon, classic)
 
     Returns:
-        Selected color in hex format, or None if cancelled
+        Dictionary with keys:
+          - "color": Selected color in hex format
+          - "preset": Selected transparency preset name
+        Returns None if cancelled
     """
     try:
         import tkinter as tk
-        from tkinter import ttk
     except ImportError:
         raise RuntimeError("tkinter is required for --picker. Install tk package (sudo pacman -S tk).")
 
-    # Normalize initial color
     try:
         initial_color = validate_hex_color(initial_color)
     except ValueError:
         initial_color = "#ff00ff"
 
-    # Theme colors
-    BG_DARK = "#1e1e2e"
-    BG_MID = "#313244"
-    BG_LIGHT = "#45475a"
-    FG_TEXT = "#cdd6f4"
-    FG_DIM = "#a6adc8"
-    ACCENT = "#cba6f7"
+    # ══════════════════════════════════════════════════════════════════════════
+    # MIDNIGHT GLASS PALETTE - Deep void with luminescent frosted panels
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # Preset vibrant colors
-    PRESETS = [
-        "#f38ba8", "#fab387", "#f9e2af", "#a6e3a1",
-        "#94e2d5", "#89dceb", "#74c7ec", "#89b4fa",
-        "#b4befe", "#cba6f7", "#f5c2e7", "#eba0ac",
-        "#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff",
+    VOID           = "#030508"      # Deepest background - the void
+    GLASS          = "#0a1220"      # Frosted glass panel fill
+    GLASS_INNER    = "#0e1a2d"      # Inner glass highlight
+    GLASS_EDGE     = "#1a3555"      # Glass border - soft glow
+    GLASS_BRIGHT   = "#2a5580"      # Bright edge highlight
+    GLASS_SHADOW   = "#020406"      # Deep shadow beneath panels
+
+    INPUT_BG       = "#081018"      # Input field background
+    INPUT_BORDER   = "#1a3050"      # Input field border
+
+    FG             = "#e4eaf4"      # Primary text - crisp white
+    FG_DIM         = "#5a7090"      # Muted text
+    FG_FAINT       = "#2a4060"      # Very subtle text
+
+    ACCENT         = "#00d4ff"      # Electric cyan - primary accent
+    ACCENT_DIM     = "#007a99"      # Dimmed cyan
+    ACCENT_GLOW    = "#00a8cc"      # Cyan glow
+
+    VIOLET         = "#a855f7"      # Secondary accent - violet
+    VIOLET_DIM     = "#7c3aed"      # Dimmed violet
+
+    SUCCESS        = "#10b981"      # Apply button - emerald
+    SUCCESS_HOVER  = "#059669"      # Apply hover
+    DANGER         = "#ef4444"      # Delete/warning
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRESET STORAGE - Persistent color presets in JSON
+    # ══════════════════════════════════════════════════════════════════════════
+
+    PRESETS_PATH = Path.home() / ".config" / "bibata-omarchy-sync" / "presets.json"
+
+    DEFAULT_PRESETS = [
+        "#00d4ff", "#a855f7", "#f472b6", "#fb923c",
+        "#10b981", "#facc15", "#ef4444", "#3b82f6",
+        "#8b5cf6", "#ec4899", "#14b8a6", "#f59e0b",
+        "#06b6d4", "#6366f1", "#84cc16", "#f97316",
     ]
 
+    def load_presets() -> list:
+        """Load presets from disk or return defaults."""
+        if PRESETS_PATH.exists():
+            try:
+                with open(PRESETS_PATH, 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and len(data) > 0:
+                        return [c for c in data if isinstance(c, str)]
+            except (json.JSONDecodeError, IOError):
+                pass
+        return DEFAULT_PRESETS.copy()
+
+    def save_presets(presets: list):
+        """Persist presets to disk."""
+        try:
+            PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(PRESETS_PATH, 'w') as f:
+                json.dump(presets, f, indent=2)
+        except IOError:
+            pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # APPLICATION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+
     root = tk.Tk()
-    root.title("Cursor Color Picker")
-    root.configure(bg=BG_DARK)
+    root.title("")  # Minimal - no title for cleaner look
+    root.configure(bg=VOID)
     root.resizable(False, False)
 
-    selected_color = [None]
-    current_hsv = list(colorsys.rgb_to_hsv(*[x/255 for x in hex_to_rgb(initial_color)]))
+    # Remove window decorations for pure glassmorphic look (optional)
+    # root.overrideredirect(True)
 
-    def hsv_to_hex(h, s, v):
+    selected_color = [None]
+    selected_preset = [initial_transparency_preset]  # Track transparency preset selection
+    current_hsv = list(colorsys.rgb_to_hsv(*[x/255 for x in hex_to_rgb(initial_color)]))
+    user_presets = load_presets()
+    _updating = [False]
+    preset_widgets = []  # Track preset swatches for rebuilding
+    transparency_buttons = []  # Track transparency preset buttons
+
+    def hsv_to_hex_local(h, s, v):
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         return rgb_to_hex(int(r * 255), int(g * 255), int(b * 255))
 
-    def update_from_hsv(*args):
-        color = hsv_to_hex(current_hsv[0], current_hsv[1], current_hsv[2])
-        update_preview(color)
+    def current_color():
+        return hsv_to_hex_local(current_hsv[0], current_hsv[1], current_hsv[2])
 
-    def update_preview(color):
-        hex_var.set(color.upper())
-        outline = ensure_contrast(color, BG_DARK)
-        draw_cursor(color, outline)
-        update_slider_colors()
+    # ══════════════════════════════════════════════════════════════════════════
+    # GLASSMORPHIC DRAWING UTILITIES
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def draw_cursor(fill_color, outline_color):
-        """Draw a cursor-shaped preview."""
-        canvas.delete("all")
+    def draw_glass_panel(canvas, x, y, w, h, glow_color=None):
+        """Draw a frosted glass panel with inner glow and edge highlights."""
+        # Outer shadow (depth)
+        canvas.create_rectangle(x+2, y+2, x+w+2, y+h+2, fill=GLASS_SHADOW, outline="")
 
-        # Draw background
-        canvas.create_rectangle(0, 0, 160, 140, fill=BG_MID, outline="")
+        # Main glass body
+        canvas.create_rectangle(x, y, x+w, y+h, fill=GLASS, outline="")
 
-        # Cursor shape points (arrow pointer) - scaled up
-        cx, cy = 80, 70  # center
-        points = [
-            cx - 30, cy - 40,  # top
-            cx - 30, cy + 20,  # left bottom
-            cx - 15, cy + 10,  # inner left
-            cx - 5, cy + 35,   # tail left
-            cx + 5, cy + 30,   # tail right
-            cx + 0, cy + 10,   # inner right
-            cx + 20, cy + 10,  # right point
+        # Inner glow gradient (top-left to bottom-right)
+        for i in range(8):
+            alpha = (8 - i) / 8.0
+            glow = glow_color if glow_color else GLASS_INNER
+            r1, g1, b1 = hex_to_rgb(GLASS)
+            r2, g2, b2 = hex_to_rgb(glow)
+            r = int(r1 + (r2 - r1) * alpha * 0.3)
+            g = int(g1 + (g2 - g1) * alpha * 0.3)
+            b = int(b1 + (b2 - b1) * alpha * 0.3)
+            canvas.create_rectangle(x+i, y+i, x+w-i, y+h-i,
+                                   fill=rgb_to_hex(r, g, b), outline="")
+
+        # Top edge highlight (light refraction)
+        canvas.create_line(x+1, y+1, x+w-1, y+1, fill=GLASS_BRIGHT, width=1)
+
+        # Left edge subtle highlight
+        canvas.create_line(x+1, y+1, x+1, y+h-1, fill=GLASS_EDGE, width=1)
+
+        # Border glow
+        canvas.create_rectangle(x, y, x+w, y+h, fill="", outline=GLASS_EDGE, width=1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CURSOR PREVIEW - Glowing Bibata cursor visualization
+    # ══════════════════════════════════════════════════════════════════════════
+
+    PREVIEW_W, PREVIEW_H = 200, 180
+
+    def draw_cursor_preview(fill_color, outline_color):
+        """Draw the Bibata cursor with ambient glow effect."""
+        preview_canvas.delete("all")
+
+        # Draw glass panel background
+        draw_glass_panel(preview_canvas, 0, 0, PREVIEW_W, PREVIEW_H, fill_color)
+
+        cx, cy = PREVIEW_W // 2, PREVIEW_H // 2 + 8
+        r_bg, g_bg, b_bg = hex_to_rgb(GLASS)
+        r_fc, g_fc, b_fc = hex_to_rgb(fill_color)
+
+        # Ambient glow - more intense, colored by selection
+        for i in range(50, 0, -1):
+            t = i / 50.0
+            blend = t * t * 0.15
+            rr = max(0, min(255, int(r_bg + (r_fc - r_bg) * blend)))
+            gg = max(0, min(255, int(g_bg + (g_fc - g_bg) * blend)))
+            bb = max(0, min(255, int(b_bg + (b_fc - b_bg) * blend)))
+            c = rgb_to_hex(rr, gg, bb)
+            rad = int(i * 2.0)
+            preview_canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad,
+                                       fill=c, outline="")
+
+        # Bibata Modern pointer vertices
+        bibata_pts = [
+            (60, 24), (46, 54), (46, 200), (56, 224), (72, 232),
+            (93, 222), (104, 210), (132, 187), (168, 181), (185, 181),
+            (199, 179), (211, 156), (201, 134), (92, 36), (76, 26),
         ]
 
-        # Draw shadow
-        shadow_points = [p + 3 for p in points]
-        canvas.create_polygon(shadow_points, fill="#11111b", outline="")
+        scale = 0.65
+        min_x = min(p[0] for p in bibata_pts)
+        max_x = max(p[0] for p in bibata_pts)
+        min_y = min(p[1] for p in bibata_pts)
+        max_y = max(p[1] for p in bibata_pts)
+        shape_w = (max_x - min_x) * scale
+        shape_h = (max_y - min_y) * scale
+        off_x = (PREVIEW_W - shape_w) / 2 - min_x * scale
+        off_y = (PREVIEW_H - shape_h) / 2 - min_y * scale
 
-        # Draw outline (larger cursor behind)
-        canvas.create_polygon(points, fill=outline_color, outline=outline_color, width=6)
+        def transform(pts):
+            flat = []
+            for x, y in pts:
+                flat.extend([x * scale + off_x, y * scale + off_y])
+            return flat
 
-        # Draw fill
-        canvas.create_polygon(points, fill=fill_color, outline="")
+        points = transform(bibata_pts)
 
-        # Label
-        canvas.create_text(80, 125, text="Preview", fill=FG_DIM, font=("Sans", 9))
+        # Drop shadow
+        shadow_pts = [p + 3 for p in points]
+        preview_canvas.create_polygon(shadow_pts, fill=GLASS_SHADOW, outline="", smooth=True)
 
-    def update_slider_colors():
-        """Update slider trough colors to show gradients."""
-        # This is a visual hint - full gradient would need custom widget
-        pass
+        # Outline layer
+        preview_canvas.create_polygon(points, fill=outline_color,
+                                      outline=outline_color, width=10,
+                                      smooth=True, joinstyle=tk.ROUND)
+
+        # Fill layer
+        preview_canvas.create_polygon(points, fill=fill_color,
+                                      outline=fill_color, width=2,
+                                      smooth=True, joinstyle=tk.ROUND)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SATURATION/VALUE PAD
+    # ══════════════════════════════════════════════════════════════════════════
+
+    SV_W, SV_H = 260, 130
+
+    def draw_sv_pad():
+        sv_canvas.delete("all")
+
+        # Glass panel effect
+        draw_glass_panel(sv_canvas, 0, 0, SV_W, SV_H)
+
+        # Color gradient - drawn in blocks for performance
+        step = 4
+        pad = 6  # Inner padding
+        for x in range(pad, SV_W - pad, step):
+            for y in range(pad, SV_H - pad, step):
+                s_val = (x - pad) / (SV_W - pad * 2)
+                v_val = 1.0 - ((y - pad) / (SV_H - pad * 2))
+                c = hsv_to_hex_local(current_hsv[0], s_val, v_val)
+                sv_canvas.create_rectangle(x, y, x + step, y + step, fill=c, outline="")
+
+        # Selection crosshair with glow
+        ix = int(current_hsv[1] * (SV_W - pad * 2)) + pad
+        iy = int((1.0 - current_hsv[2]) * (SV_H - pad * 2)) + pad
+        ix = max(pad + 4, min(SV_W - pad - 4, ix))
+        iy = max(pad + 4, min(SV_H - pad - 4, iy))
+
+        # Outer glow ring
+        sv_canvas.create_oval(ix - 10, iy - 10, ix + 10, iy + 10,
+                             outline=ACCENT_DIM, width=2, fill="")
+        # Inner ring
+        ring_color = "#ffffff" if current_hsv[2] < 0.6 else "#000000"
+        sv_canvas.create_oval(ix - 6, iy - 6, ix + 6, iy + 6,
+                             outline=ring_color, width=2, fill="")
+        # Center dot
+        sv_canvas.create_oval(ix - 2, iy - 2, ix + 2, iy + 2,
+                             fill=ACCENT, outline="")
+
+    def on_sv_event(event):
+        pad = 6
+        s = max(0.0, min(1.0, (event.x - pad) / (SV_W - pad * 2)))
+        v = max(0.0, min(1.0, 1.0 - (event.y - pad) / (SV_H - pad * 2)))
+        current_hsv[1] = s
+        current_hsv[2] = v
+        sync_all()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HUE BAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    HUE_W, HUE_H = 260, 20
+
+    def draw_hue_bar():
+        hue_canvas.delete("all")
+
+        # Glass panel background
+        draw_glass_panel(hue_canvas, 0, 0, HUE_W, HUE_H)
+
+        # Hue gradient
+        pad = 4
+        for x in range(pad, HUE_W - pad):
+            h_val = (x - pad) / (HUE_W - pad * 2)
+            c = hsv_to_hex_local(h_val, 1.0, 1.0)
+            hue_canvas.create_line(x, pad, x, HUE_H - pad, fill=c)
+
+        # Position indicator with glow
+        ix = int(current_hsv[0] * (HUE_W - pad * 2)) + pad
+        ix = max(pad + 3, min(HUE_W - pad - 3, ix))
+
+        # Glow behind indicator
+        for i in range(4, 0, -1):
+            glow_alpha = i / 4.0
+            hue_canvas.create_rectangle(ix - 3 - i, 1, ix + 3 + i, HUE_H - 1,
+                                       fill="", outline=ACCENT_DIM, width=1)
+
+        # Main indicator
+        hue_canvas.create_rectangle(ix - 3, 2, ix + 3, HUE_H - 2,
+                                   fill="", outline=FG, width=2)
+
+    def on_hue_event(event):
+        pad = 4
+        h = max(0.0, min(1.0, (event.x - pad) / (HUE_W - pad * 2)))
+        current_hsv[0] = h
+        sync_all()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SYNC & COLOR UPDATES
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def sync_all():
+        if _updating[0]:
+            return
+        _updating[0] = True
+
+        color = current_color()
+        hex_var.set(color.upper())
+        outline = ensure_contrast(color, VOID)
+
+        draw_cursor_preview(color, outline)
+        draw_sv_pad()
+        draw_hue_bar()
+
+        # Update hex swatch
+        try:
+            hex_swatch_canvas.delete("all")
+            hex_swatch_canvas.create_rectangle(0, 0, 24, 24, fill=color, outline=GLASS_EDGE)
+            # Inner highlight
+            hex_swatch_canvas.create_line(1, 1, 23, 1, fill=lighten_color(color, 0.2))
+        except tk.TclError:
+            pass
+
+        _updating[0] = False
 
     def set_color_from_hex(hex_color):
         try:
@@ -354,242 +728,415 @@ def open_color_picker(initial_color: str = "#ff00ff") -> Optional[str]:
             r, g, b = hex_to_rgb(hex_color)
             h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
             current_hsv[0], current_hsv[1], current_hsv[2] = h, s, v
-            hue_var.set(h * 360)
-            sat_var.set(s * 100)
-            val_var.set(v * 100)
-            update_preview(hex_color)
+            sync_all()
         except ValueError:
             pass
 
-    def on_slider_change(*args):
-        current_hsv[0] = hue_var.get() / 360
-        current_hsv[1] = sat_var.get() / 100
-        current_hsv[2] = val_var.get() / 100
-        update_from_hsv()
-
-    def on_preset_click(color):
-        set_color_from_hex(color)
-
-    def on_random():
-        color = generate_random_vibrant_color()
-        set_color_from_hex(color)
-
-    def on_hex_entry(*args):
+    def on_hex_entry(*_):
+        raw = hex_var.get().strip()
         try:
-            color = validate_hex_color(hex_var.get())
+            color = validate_hex_color(raw)
             r, g, b = hex_to_rgb(color)
             h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
             current_hsv[0], current_hsv[1], current_hsv[2] = h, s, v
-            hue_var.set(h * 360)
-            sat_var.set(s * 100)
-            val_var.set(v * 100)
-            outline = ensure_contrast(color, BG_DARK)
-            draw_cursor(color, outline)
+            sync_all()
         except ValueError:
             pass
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRESET MANAGEMENT
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def add_current_to_presets():
+        """Add current color to presets if not already present."""
+        color = current_color().lower()
+        if color not in [c.lower() for c in user_presets]:
+            user_presets.insert(0, color)
+            if len(user_presets) > 24:  # Max presets
+                user_presets.pop()
+            save_presets(user_presets)
+            rebuild_preset_grid()
+
+    def remove_preset(color):
+        """Remove a preset color."""
+        color_lower = color.lower()
+        for i, c in enumerate(user_presets):
+            if c.lower() == color_lower:
+                user_presets.pop(i)
+                save_presets(user_presets)
+                rebuild_preset_grid()
+                break
+
+    def rebuild_preset_grid():
+        """Rebuild the preset swatch grid."""
+        # Clear existing widgets
+        for w in preset_widgets:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        preset_widgets.clear()
+
+        swatch_size = 28
+        per_row = 8
+
+        for i, pcolor in enumerate(user_presets[:24]):
+            row_idx = i // per_row
+            col_idx = i % per_row
+
+            swatch = tk.Canvas(
+                preset_grid, width=swatch_size, height=swatch_size,
+                bg=GLASS, highlightthickness=0, bd=0, cursor="hand2",
+            )
+            swatch.grid(row=row_idx, column=col_idx, padx=3, pady=3)
+            preset_widgets.append(swatch)
+
+            # Draw the swatch with glass effect
+            def draw_swatch(canvas, color, hover=False, delete_mode=False):
+                canvas.delete("all")
+                # Background
+                canvas.create_rectangle(0, 0, swatch_size, swatch_size,
+                                       fill=color, outline="")
+                # Top highlight
+                canvas.create_line(1, 1, swatch_size-1, 1,
+                                  fill=lighten_color(color, 0.25))
+                # Border
+                border_color = FG if hover else GLASS_EDGE
+                canvas.create_rectangle(0, 0, swatch_size-1, swatch_size-1,
+                                       fill="", outline=border_color, width=1 if not hover else 2)
+
+                # Delete mode: show X
+                if delete_mode:
+                    canvas.create_line(6, 6, swatch_size-6, swatch_size-6, fill=FG, width=2)
+                    canvas.create_line(swatch_size-6, 6, 6, swatch_size-6, fill=FG, width=2)
+
+            draw_swatch(swatch, pcolor)
+
+            # Bind events
+            def make_click(c):
+                return lambda e: set_color_from_hex(c)
+
+            def make_enter(canvas, c):
+                return lambda e: draw_swatch(canvas, c, hover=True)
+
+            def make_leave(canvas, c):
+                return lambda e: draw_swatch(canvas, c, hover=False)
+
+            def make_right_click(canvas, c):
+                def handler(e):
+                    draw_swatch(canvas, c, hover=True, delete_mode=True)
+                    canvas.after(150, lambda: remove_preset(c))
+                return handler
+
+            swatch.bind("<Button-1>", make_click(pcolor))
+            swatch.bind("<Button-3>", make_right_click(swatch, pcolor))
+            swatch.bind("<Enter>", make_enter(swatch, pcolor))
+            swatch.bind("<Leave>", make_leave(swatch, pcolor))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ACTIONS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def on_random():
+        set_color_from_hex(generate_random_vibrant_color())
+
     def confirm():
-        selected_color[0] = hex_var.get().lower()
+        selected_color[0] = hex_var.get().strip().lower()
+        try:
+            validate_hex_color(selected_color[0])
+        except ValueError:
+            selected_color[0] = current_color()
         root.quit()
         root.destroy()
+
+    def select_transparency(preset_name: str):
+        """Select a transparency preset and update all button visuals."""
+        selected_preset[0] = preset_name
+        for btn, frame, btn_name in transparency_buttons:
+            if btn_name == preset_name:
+                btn.configure(fg=FG, bg=GLASS_INNER)
+                frame.configure(bg=GLASS_EDGE)
+            else:
+                btn.configure(fg=FG_DIM, bg=GLASS)
+                frame.configure(bg=GLASS)
 
     def cancel():
         root.quit()
         root.destroy()
 
-    # === Layout ===
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYOUT - Glassmorphic floating panels
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # Main container
-    main_frame = tk.Frame(root, bg=BG_DARK, padx=20, pady=15)
-    main_frame.pack(fill=tk.BOTH, expand=True)
+    # Main container with subtle outer glow
+    outer_glow = tk.Frame(root, bg=GLASS_EDGE, padx=1, pady=1)
+    outer_glow.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-    # Title
-    title = tk.Label(
-        main_frame,
-        text="Cursor Color Picker",
-        font=("Sans", 14, "bold"),
-        fg=FG_TEXT,
-        bg=BG_DARK
-    )
-    title.pack(pady=(0, 15))
+    main = tk.Frame(outer_glow, bg=VOID, padx=20, pady=16)
+    main.pack(fill=tk.BOTH, expand=True)
 
-    # Content frame (left: preview, right: controls)
-    content = tk.Frame(main_frame, bg=BG_DARK)
-    content.pack(fill=tk.BOTH, expand=True)
+    # ── HEADER: Title + Hex Input ──────────────────────────────────────────────
+    header = tk.Frame(main, bg=VOID)
+    header.pack(fill=tk.X, pady=(0, 14))
 
-    # Left side - Cursor preview
-    left_frame = tk.Frame(content, bg=BG_DARK)
-    left_frame.pack(side=tk.LEFT, padx=(0, 20))
+    # Title with accent dot
+    title_frame = tk.Frame(header, bg=VOID)
+    title_frame.pack(side=tk.LEFT)
 
-    canvas = tk.Canvas(
-        left_frame,
-        width=160,
-        height=140,
-        bg=BG_MID,
-        highlightthickness=1,
-        highlightbackground=BG_LIGHT
-    )
-    canvas.pack()
+    dot_canvas = tk.Canvas(title_frame, width=8, height=8, bg=VOID, highlightthickness=0)
+    dot_canvas.pack(side=tk.LEFT, padx=(0, 8), pady=4)
+    dot_canvas.create_oval(0, 0, 8, 8, fill=ACCENT, outline="")
 
-    # Hex display/entry
+    tk.Label(title_frame, text="CURSOR COLOR", font=("Helvetica Neue", 10, "bold"),
+             fg=FG_DIM, bg=VOID, anchor=tk.W).pack(side=tk.LEFT)
+
+    # Hex input with glass styling
+    hex_frame = tk.Frame(header, bg=INPUT_BORDER, padx=1, pady=1)
+    hex_frame.pack(side=tk.RIGHT)
+
+    hex_inner = tk.Frame(hex_frame, bg=INPUT_BG, padx=6, pady=4)
+    hex_inner.pack()
+
+    hex_swatch_canvas = tk.Canvas(hex_inner, width=24, height=24, bg=GLASS, highlightthickness=0, bd=0)
+    hex_swatch_canvas.pack(side=tk.LEFT, padx=(0, 8))
+
     hex_var = tk.StringVar(value=initial_color.upper())
     hex_entry = tk.Entry(
-        left_frame,
-        textvariable=hex_var,
-        font=("Monospace", 12, "bold"),
-        fg=ACCENT,
-        bg=BG_MID,
-        insertbackground=FG_TEXT,
-        justify=tk.CENTER,
-        width=10,
-        relief=tk.FLAT
+        hex_inner, textvariable=hex_var,
+        font=("JetBrains Mono", 11), fg=ACCENT, bg=INPUT_BG,
+        insertbackground=ACCENT, justify=tk.LEFT,
+        width=9, relief=tk.FLAT, bd=0,
     )
-    hex_entry.pack(pady=(10, 0))
+    hex_entry.pack(side=tk.LEFT)
     hex_entry.bind("<Return>", on_hex_entry)
     hex_entry.bind("<FocusOut>", on_hex_entry)
 
-    # Right side - Controls
-    right_frame = tk.Frame(content, bg=BG_DARK)
-    right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    # ── BODY: Preview + Controls ───────────────────────────────────────────────
+    body = tk.Frame(main, bg=VOID)
+    body.pack(fill=tk.BOTH, expand=True)
 
-    # HSV Sliders
-    slider_frame = tk.Frame(right_frame, bg=BG_DARK)
-    slider_frame.pack(fill=tk.X, pady=(0, 15))
+    # Left: Cursor preview
+    preview_frame = tk.Frame(body, bg=VOID)
+    preview_frame.pack(side=tk.LEFT, padx=(0, 16))
 
-    # Slider style
-    style = ttk.Style()
-    style.theme_use('clam')
-    style.configure("Custom.Horizontal.TScale", background=BG_DARK, troughcolor=BG_MID)
+    preview_canvas = tk.Canvas(
+        preview_frame, width=PREVIEW_W, height=PREVIEW_H,
+        bg=VOID, highlightthickness=0, bd=0,
+    )
+    preview_canvas.pack()
 
-    h, s, v = current_hsv
-    hue_var = tk.DoubleVar(value=h * 360)
-    sat_var = tk.DoubleVar(value=s * 100)
-    val_var = tk.DoubleVar(value=v * 100)
+    # Right: Controls
+    controls = tk.Frame(body, bg=VOID)
+    controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    sliders = [
-        ("Hue", hue_var, 0, 360, "#f38ba8"),
-        ("Sat", sat_var, 0, 100, "#a6e3a1"),
-        ("Val", val_var, 0, 100, "#89b4fa"),
+    # SV Pad
+    sv_canvas = tk.Canvas(
+        controls, width=SV_W, height=SV_H,
+        bg=VOID, highlightthickness=0, bd=0, cursor="crosshair",
+    )
+    sv_canvas.pack(pady=(0, 10))
+    sv_canvas.bind("<Button-1>", on_sv_event)
+    sv_canvas.bind("<B1-Motion>", on_sv_event)
+
+    # Hue bar with label
+    hue_row = tk.Frame(controls, bg=VOID)
+    hue_row.pack(fill=tk.X)
+
+    tk.Label(hue_row, text="HUE", font=("Helvetica Neue", 7),
+             fg=FG_FAINT, bg=VOID).pack(side=tk.LEFT, padx=(0, 8))
+
+    hue_canvas = tk.Canvas(
+        hue_row, width=HUE_W, height=HUE_H,
+        bg=VOID, highlightthickness=0, bd=0, cursor="sb_h_double_arrow",
+    )
+    hue_canvas.pack(side=tk.LEFT)
+    hue_canvas.bind("<Button-1>", on_hue_event)
+    hue_canvas.bind("<B1-Motion>", on_hue_event)
+
+    # ── PRESETS SECTION ────────────────────────────────────────────────────────
+    preset_section = tk.Frame(main, bg=VOID)
+    preset_section.pack(fill=tk.X, pady=(14, 0))
+
+    # Presets header with add button
+    preset_header = tk.Frame(preset_section, bg=VOID)
+    preset_header.pack(fill=tk.X, pady=(0, 8))
+
+    tk.Label(preset_header, text="PRESETS", font=("Helvetica Neue", 7),
+             fg=FG_FAINT, bg=VOID).pack(side=tk.LEFT)
+
+    # Divider line
+    divider = tk.Canvas(preset_header, height=1, bg=VOID, highlightthickness=0)
+    divider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+    divider.create_line(0, 0, 500, 0, fill=FG_FAINT)
+
+    # Add preset button
+    add_btn_frame = tk.Frame(preset_header, bg=GLASS_EDGE, padx=1, pady=1)
+    add_btn_frame.pack(side=tk.RIGHT)
+
+    add_btn = tk.Label(
+        add_btn_frame, text=" + ", font=("Helvetica Neue", 10, "bold"),
+        fg=ACCENT, bg=GLASS, padx=6, pady=1, cursor="hand2",
+    )
+    add_btn.pack()
+    add_btn.bind("<Button-1>", lambda e: add_current_to_presets())
+    add_btn.bind("<Enter>", lambda e: add_btn.configure(bg=GLASS_INNER, fg=FG))
+    add_btn.bind("<Leave>", lambda e: add_btn.configure(bg=GLASS, fg=ACCENT))
+
+    # Hint text
+    tk.Label(preset_header, text="right-click to remove", font=("Helvetica Neue", 7),
+             fg=FG_FAINT, bg=VOID).pack(side=tk.RIGHT, padx=(0, 8))
+
+    # Preset grid container
+    preset_container = tk.Frame(preset_section, bg=GLASS_EDGE, padx=1, pady=1)
+    preset_container.pack(fill=tk.X)
+
+    preset_inner = tk.Frame(preset_container, bg=GLASS, padx=8, pady=8)
+    preset_inner.pack(fill=tk.X)
+
+    preset_grid = tk.Frame(preset_inner, bg=GLASS)
+    preset_grid.pack()
+
+    # Build initial preset grid
+    rebuild_preset_grid()
+
+    # ── TRANSPARENCY PRESETS ───────────────────────────────────────────────────
+    transparency_section = tk.Frame(main, bg=VOID)
+    transparency_section.pack(fill=tk.X, pady=(14, 0))
+
+    # Transparency header
+    trans_header = tk.Frame(transparency_section, bg=VOID)
+    trans_header.pack(fill=tk.X, pady=(0, 8))
+
+    tk.Label(trans_header, text="TRANSPARENCY EFFECT", font=("Helvetica Neue", 7),
+             fg=FG_FAINT, bg=VOID).pack(side=tk.LEFT)
+
+    # Divider line
+    divider2 = tk.Canvas(trans_header, height=1, bg=VOID, highlightthickness=0)
+    divider2.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+    divider2.create_line(0, 0, 500, 0, fill=FG_FAINT)
+
+    # Transparency preset buttons
+    trans_button_frame = tk.Frame(transparency_section, bg=GLASS_EDGE, padx=1, pady=1)
+    trans_button_frame.pack(fill=tk.X)
+
+    trans_inner = tk.Frame(trans_button_frame, bg=GLASS, padx=8, pady=8)
+    trans_inner.pack(fill=tk.X)
+
+    # Define transparency presets with descriptions
+    transparency_presets_info = [
+        ("auto", "Auto", "Theme-aware selection"),
+        ("glass", "Glass", "75% opacity, polished"),
+        ("neon", "Neon", "60% opacity, glow"),
+        ("shadow", "Shadow", "95% opacity, sharp"),
+        ("classic", "Classic", "100% opaque"),
     ]
 
-    for label_text, var, from_, to, color in sliders:
-        row = tk.Frame(slider_frame, bg=BG_DARK)
-        row.pack(fill=tk.X, pady=3)
+    trans_buttons_row = tk.Frame(trans_inner, bg=GLASS)
+    trans_buttons_row.pack()
 
-        lbl = tk.Label(row, text=label_text, fg=color, bg=BG_DARK, font=("Sans", 9), width=4, anchor=tk.W)
-        lbl.pack(side=tk.LEFT)
+    for preset_id, preset_label, preset_desc in transparency_presets_info:
+        is_selected = preset_id == selected_preset[0]
 
-        slider = ttk.Scale(
-            row,
-            from_=from_,
-            to=to,
-            variable=var,
-            orient=tk.HORIZONTAL,
-            style="Custom.Horizontal.TScale",
-            command=on_slider_change
+        btn_frame = tk.Frame(trans_buttons_row, bg=GLASS_EDGE if is_selected else GLASS, padx=1, pady=1)
+        btn_frame.pack(side=tk.LEFT, padx=3, pady=3)
+
+        btn = tk.Label(
+            btn_frame, text=preset_label, font=("Helvetica Neue", 9, "bold"),
+            fg=FG if is_selected else FG_DIM,
+            bg=GLASS_INNER if is_selected else GLASS,
+            padx=8, pady=4, cursor="hand2",
+            relief=tk.FLAT, bd=0,
         )
-        slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
+        btn.pack()
+        transparency_buttons.append((btn, btn_frame, preset_id))
 
-        val_lbl = tk.Label(row, textvariable=var, fg=FG_DIM, bg=BG_DARK, font=("Sans", 8), width=5)
-        val_lbl.pack(side=tk.LEFT)
+        def make_click(p):
+            return lambda e: select_transparency(p)
 
-    # Preset colors label
-    preset_label = tk.Label(
-        right_frame,
-        text="Presets",
-        fg=FG_DIM,
-        bg=BG_DARK,
-        font=("Sans", 9)
+        def make_enter(b, p):
+            def handler(e):
+                if selected_preset[0] != p:
+                    b.configure(fg=FG)
+            return handler
+
+        def make_leave(b, p):
+            def handler(e):
+                if selected_preset[0] != p:
+                    b.configure(fg=FG_DIM)
+            return handler
+
+        btn.bind("<Button-1>", make_click(preset_id))
+        btn.bind("<Enter>", make_enter(btn, preset_id))
+        btn.bind("<Leave>", make_leave(btn, preset_id))
+
+    # ── BOTTOM: Actions ────────────────────────────────────────────────────────
+    bottom = tk.Frame(main, bg=VOID)
+    bottom.pack(fill=tk.X, pady=(14, 0))
+
+    # Random button (left)
+    rand_frame = tk.Frame(bottom, bg=GLASS_EDGE, padx=1, pady=1)
+    rand_frame.pack(side=tk.LEFT)
+
+    random_btn = tk.Label(
+        rand_frame, text="  Random  ", font=("Helvetica Neue", 9),
+        fg=VIOLET, bg=GLASS, padx=10, pady=5, cursor="hand2",
     )
-    preset_label.pack(anchor=tk.W)
+    random_btn.pack()
+    random_btn.bind("<Button-1>", lambda e: on_random())
+    random_btn.bind("<Enter>", lambda e: random_btn.configure(bg=GLASS_INNER, fg=FG))
+    random_btn.bind("<Leave>", lambda e: random_btn.configure(bg=GLASS, fg=VIOLET))
 
-    # Preset color grid
-    preset_frame = tk.Frame(right_frame, bg=BG_DARK)
-    preset_frame.pack(fill=tk.X, pady=(5, 10))
+    # Cancel button
+    cancel_frame = tk.Frame(bottom, bg=GLASS_EDGE, padx=1, pady=1)
+    cancel_frame.pack(side=tk.RIGHT, padx=(8, 0))
 
-    for i, color in enumerate(PRESETS):
-        btn = tk.Button(
-            preset_frame,
-            bg=color,
-            activebackground=color,
-            width=2,
-            height=1,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=lambda c=color: on_preset_click(c)
-        )
-        btn.grid(row=i // 8, column=i % 8, padx=1, pady=1)
-
-    # Random button
-    random_btn = tk.Button(
-        right_frame,
-        text="🎲 Random",
-        command=on_random,
-        bg=BG_MID,
-        fg=FG_TEXT,
-        activebackground=BG_LIGHT,
-        activeforeground=FG_TEXT,
-        font=("Sans", 9),
-        relief=tk.FLAT,
-        cursor="hand2",
-        padx=10,
-        pady=3
+    cancel_btn = tk.Label(
+        cancel_frame, text="  Cancel  ", font=("Helvetica Neue", 9),
+        fg=FG_DIM, bg=GLASS, padx=12, pady=5, cursor="hand2",
     )
-    random_btn.pack(anchor=tk.W, pady=(5, 0))
+    cancel_btn.pack()
+    cancel_btn.bind("<Button-1>", lambda e: cancel())
+    cancel_btn.bind("<Enter>", lambda e: cancel_btn.configure(fg=FG))
+    cancel_btn.bind("<Leave>", lambda e: cancel_btn.configure(fg=FG_DIM))
 
-    # Bottom buttons
-    btn_frame = tk.Frame(main_frame, bg=BG_DARK)
-    btn_frame.pack(fill=tk.X, pady=(15, 0))
+    # Apply button (accent styled)
+    apply_frame = tk.Frame(bottom, bg=SUCCESS, padx=1, pady=1)
+    apply_frame.pack(side=tk.RIGHT)
 
-    cancel_btn = tk.Button(
-        btn_frame,
-        text="Cancel",
-        command=cancel,
-        bg=BG_MID,
-        fg=FG_TEXT,
-        activebackground=BG_LIGHT,
-        activeforeground=FG_TEXT,
-        font=("Sans", 10),
-        relief=tk.FLAT,
-        padx=20,
-        pady=6,
-        cursor="hand2"
+    apply_btn = tk.Label(
+        apply_frame, text="  Apply  ", font=("Helvetica Neue", 10, "bold"),
+        fg=VOID, bg=SUCCESS, padx=16, pady=5, cursor="hand2",
     )
-    cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
+    apply_btn.pack()
+    apply_btn.bind("<Button-1>", lambda e: confirm())
+    apply_btn.bind("<Enter>", lambda e: apply_btn.configure(bg=SUCCESS_HOVER))
+    apply_btn.bind("<Leave>", lambda e: apply_btn.configure(bg=SUCCESS))
 
-    apply_btn = tk.Button(
-        btn_frame,
-        text="Apply",
-        command=confirm,
-        bg="#a6e3a1",
-        fg=BG_DARK,
-        activebackground="#94d990",
-        activeforeground=BG_DARK,
-        font=("Sans", 10, "bold"),
-        relief=tk.FLAT,
-        padx=20,
-        pady=6,
-        cursor="hand2"
-    )
-    apply_btn.pack(side=tk.RIGHT)
+    # ── KEYBOARD SHORTCUTS ─────────────────────────────────────────────────────
+    root.bind("<Escape>", lambda e: cancel())
+    root.bind("<Return>", lambda e: confirm())
 
-    # Initialize preview
-    outline = ensure_contrast(initial_color, BG_DARK)
-    draw_cursor(initial_color, outline)
+    # ── INITIALIZE ─────────────────────────────────────────────────────────────
+    sync_all()
 
-    # Center window
+    # Center window on screen
     root.update_idletasks()
-    w, h = root.winfo_width(), root.winfo_height()
+    w = root.winfo_width()
+    h = root.winfo_height()
     x = (root.winfo_screenwidth() - w) // 2
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"+{x}+{y}")
 
-    # Handle window close
     root.protocol("WM_DELETE_WINDOW", cancel)
-
     root.mainloop()
 
-    return selected_color[0]
+    # Return both color and preset, or None if cancelled
+    if selected_color[0]:
+        return {
+            "color": selected_color[0],
+            "preset": selected_preset[0],
+        }
+    return None
 
 # ============================================================================
 # Theme Color Parsing
@@ -787,15 +1334,31 @@ def get_theme_hash(theme_path: Path, color_source: str) -> str:
         return hashlib.sha256(content).hexdigest()[:16]
     return ""
 
-def get_cursor_theme_name(theme_name: str) -> str:
-    """Generate a safe cursor theme name."""
+def get_cursor_theme_name(theme_name: str, preset: Optional[str] = None) -> str:
+    """Generate a safe cursor theme name, optionally including preset.
+
+    Args:
+        theme_name: Base theme name
+        preset: Optional transparency preset name (e.g., "glass", "neon")
+                If provided, appends to theme name for uniqueness
+
+    Returns:
+        Safe cursor theme name like "Bibata-Omarchy-catppuccin-mocha" or
+        "Bibata-Omarchy-catppuccin-mocha-glass" if preset provided
+    """
     # Make filesystem-safe
     safe_name = "".join(c if c.isalnum() or c in "-_" else "-" for c in theme_name)
-    return f"Bibata-Omarchy-{safe_name}"
+    base_name = f"Bibata-Omarchy-{safe_name}"
 
-def get_color_hash(base: str, outline: str, watch: str) -> str:
-    """Generate a hash from cursor colors for caching."""
-    color_str = f"{base.lower()}{outline.lower()}{watch.lower()}"
+    # Include preset in theme name if not default (classic/opaque)
+    if preset and preset != "classic":
+        return f"{base_name}-{preset}"
+    return base_name
+
+def get_color_hash(base: str, outline: str, watch: str, preset: Optional[str] = None) -> str:
+    """Generate a hash from cursor colors and preset for caching."""
+    preset_str = preset if preset else "classic"
+    color_str = f"{base.lower()}{outline.lower()}{watch.lower()}{preset_str}"
     return hashlib.sha256(color_str.encode()).hexdigest()[:12]
 
 def check_color_cache(config: Config, color_hash: str) -> Optional[str]:
@@ -831,32 +1394,54 @@ def update_color_cache(config: Config, color_hash: str, cursor_theme_name: str):
     except Exception:
         pass
 
-def check_cache(config: Config, theme_name: str, theme_hash: str) -> bool:
-    """Check if a valid cached cursor theme exists."""
-    cursor_theme_name = get_cursor_theme_name(theme_name)
+def check_cache(config: Config, theme_name: str, theme_hash: str, preset: Optional[str] = None) -> bool:
+    """Check if a valid cached cursor theme exists for this theme and preset.
+
+    Args:
+        config: Configuration object
+        theme_name: Theme name
+        theme_hash: Hash of theme's color file
+        preset: Transparency preset name (optional, checked against cached preset)
+
+    Returns:
+        True if cached theme exists with matching hash and preset
+    """
+    cursor_theme_name = get_cursor_theme_name(theme_name, preset)
     theme_dest = config.icons_dir / cursor_theme_name
     cache_meta = config.cache_dir / theme_name / "meta.json"
-    
+
     if not theme_dest.exists() or not cache_meta.exists():
         return False
-    
+
     try:
         with open(cache_meta) as f:
             meta = json.load(f)
-        return meta.get("hash") == theme_hash
+        # Check both hash and preset match
+        hash_match = meta.get("hash") == theme_hash
+        preset_match = meta.get("preset") == (preset or "classic")
+        return hash_match and preset_match
     except Exception:
         return False
 
-def update_cache_meta(config: Config, theme_name: str, theme_hash: str, cursor_theme_name: str):
-    """Update cache metadata after successful build."""
+def update_cache_meta(config: Config, theme_name: str, theme_hash: str, cursor_theme_name: str, preset: Optional[str] = None):
+    """Update cache metadata after successful build.
+
+    Args:
+        config: Configuration object
+        theme_name: Theme name
+        theme_hash: Hash of theme's color file
+        cursor_theme_name: Generated cursor theme name (with preset if applicable)
+        preset: Transparency preset name (optional)
+    """
     cache_theme_dir = config.cache_dir / theme_name
     cache_theme_dir.mkdir(parents=True, exist_ok=True)
-    
+
     meta = {
         "hash": theme_hash,
         "cursor_theme_name": cursor_theme_name,
+        "preset": preset or "classic",
     }
-    
+
     with open(cache_theme_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -870,25 +1455,32 @@ def build_cursor_theme(
     base_color: str,
     outline_color: str,
     watch_color: str,
-    logger: logging.Logger
+    logger: logging.Logger,
+    preset: Optional[TransparencyPreset] = None
 ) -> Path:
-    """Build Bibata cursor theme with custom colors."""
-    
-    cursor_theme_name = get_cursor_theme_name(theme_name)
+    """Build Bibata cursor theme with custom colors and optional transparency."""
+
+    cursor_theme_name = get_cursor_theme_name(theme_name, preset.name if preset else None)
     bitmap_dir = config.cache_dir / theme_name / "bitmaps"
-    
+
     # Ensure clean bitmap directory
     if bitmap_dir.exists():
         shutil.rmtree(bitmap_dir)
     bitmap_dir.mkdir(parents=True, exist_ok=True)
-    
-    svg_dir = config.bibata_source_dir / "svg" / config.cursor_style
-    
-    if not svg_dir.exists():
-        raise FileNotFoundError(f"SVG directory not found: {svg_dir}")
-    
+
+    original_svg_dir = config.bibata_source_dir / "svg" / config.cursor_style
+
+    if not original_svg_dir.exists():
+        raise FileNotFoundError(f"SVG directory not found: {original_svg_dir}")
+
+    # Apply transparency if preset provided (returns temp dir or original)
+    svg_dir = apply_transparency(original_svg_dir, preset) if preset else original_svg_dir
+    temp_svg_dir = svg_dir if svg_dir != original_svg_dir else None
+
     # Step 1: Run cbmp to render SVGs to PNGs
     logger.info(f"Rendering cursor bitmaps with colors: base={base_color}, outline={outline_color}, watch={watch_color}")
+    if preset and preset.name != "classic":
+        logger.info(f"  Transparency preset: {preset.name} (base={preset.base_opacity}, outline={preset.outline_opacity})")
     logger.info("  [1/2] Rendering SVGs to bitmaps (this takes ~10-15s)...")
 
     cbmp_cmd = [
@@ -920,9 +1512,13 @@ def build_cursor_theme(
 
     process.wait()
 
+    # Clean up temp SVG directory if we created one
+    if temp_svg_dir and temp_svg_dir.exists():
+        shutil.rmtree(temp_svg_dir)
+
     if process.returncode != 0:
         logger.error(f"cbmp failed: {''.join(output_lines)}")
-        raise RuntimeError(f"cbmp failed")
+        raise RuntimeError("cbmp failed")
 
     logger.info("  Bitmap rendering complete")
     
@@ -1182,6 +1778,12 @@ def main():
         action="store_true",
         help="Open GUI color picker to select cursor color"
     )
+    parser.add_argument(
+        "--transparency",
+        metavar="PRESET",
+        choices=["auto", "glass", "shadow", "neon", "classic"],
+        help="Transparency preset: auto (default), glass, shadow, neon, or classic"
+    )
 
     args = parser.parse_args()
 
@@ -1209,10 +1811,13 @@ def main():
     if args.picker:
         try:
             initial = cli_base_color or "#ff00ff"
-            picked_color = open_color_picker(initial)
-            if picked_color:
-                cli_base_color = picked_color
-                logger.info(f"Selected color: {picked_color}")
+            picked = open_color_picker(initial)
+            if picked:
+                cli_base_color = picked["color"]
+                # Override transparency preset from picker if user selected one
+                if not args.transparency:
+                    args.transparency = picked["preset"]
+                logger.info(f"Selected color: {picked['color']} with preset: {picked['preset']}")
             else:
                 logger.info("Color picker cancelled")
                 sys.exit(0)
@@ -1246,11 +1851,16 @@ def main():
         outline_color = cli_outline_color.upper() if cli_outline_color else ensure_contrast(base_color, "#1e1e2e").upper()
         watch_color = cli_watch_color.upper() if cli_watch_color else darken_color(outline_color, 0.2).upper()
 
-        cursor_theme_name = get_cursor_theme_name(theme_name)
+        # For color-only mode, use explicit transparency preset
+        preset_override = args.transparency or "classic"  # Default to classic for color-only
+        transparency_preset = select_transparency_preset({}, preset_override)
+
+        cursor_theme_name = get_cursor_theme_name(theme_name, transparency_preset.name)
         logger.info(f"Building custom cursor with colors:")
         logger.info(f"  Base:    {base_color}")
         logger.info(f"  Outline: {outline_color}")
         logger.info(f"  Watch:   {watch_color}")
+        logger.info(f"  Transparency: {transparency_preset.name}")
 
     else:
         # Standard theme-based mode
@@ -1274,14 +1884,20 @@ def main():
             logger.error(f"Theme not found: {theme_path}")
             sys.exit(1)
 
-        cursor_theme_name = get_cursor_theme_name(theme_name)
-
         # Extract colors from theme
         logger.info("Extracting theme colors...")
         colors = extract_theme_colors(theme_path, config.color_source)
 
         # Compute cursor colors from theme
         base_color, outline_color, watch_color = compute_cursor_colors(colors, config)
+
+        # Determine transparency preset based on theme properties
+        theme_props = analyze_theme_properties(colors)
+        preset_override = args.transparency or config.transparency_preset
+        transparency_preset = select_transparency_preset(theme_props, preset_override)
+
+        # Now generate cursor theme name with preset included
+        cursor_theme_name = get_cursor_theme_name(theme_name, transparency_preset.name)
 
         # Apply overrides: CLI args > config file > auto-computed
         # Config file overrides
@@ -1318,6 +1934,7 @@ def main():
         logger.info(f"  Base:    {base_color}")
         logger.info(f"  Outline: {outline_color}")
         logger.info(f"  Watch:   {watch_color}")
+        logger.info(f"  Transparency: {transparency_preset.name}")
 
     if args.dry_run:
         logger.info("Dry run - no changes made")
@@ -1325,7 +1942,7 @@ def main():
 
     try:
         # First: check color-based cache (works for any color combo)
-        color_hash = get_color_hash(base_color, outline_color, watch_color)
+        color_hash = get_color_hash(base_color, outline_color, watch_color, transparency_preset.name)
         cached_theme = check_color_cache(config, color_hash) if not args.force else None
 
         if cached_theme:
@@ -1344,22 +1961,23 @@ def main():
 
             if use_theme_cache:
                 theme_hash = get_theme_hash(theme_path, config.color_source)
-                if check_cache(config, theme_name, theme_hash):
-                    logger.info("Using cached cursor theme (colors unchanged)")
+                if check_cache(config, theme_name, theme_hash, transparency_preset.name):
+                    logger.info("Using cached cursor theme (colors and preset unchanged)")
                 else:
                     # Build cursor theme
                     logger.info("Building cursor theme...")
                     theme_src = build_cursor_theme(
                         config, theme_name,
                         base_color, outline_color, watch_color,
-                        logger
+                        logger,
+                        transparency_preset
                     )
 
                     # Install
                     install_cursor_theme(config, theme_src, cursor_theme_name, logger)
 
                     # Update both caches
-                    update_cache_meta(config, theme_name, theme_hash, cursor_theme_name)
+                    update_cache_meta(config, theme_name, theme_hash, cursor_theme_name, transparency_preset.name)
                     update_color_cache(config, color_hash, cursor_theme_name)
             else:
                 # Build for custom colors or forced rebuild
@@ -1367,7 +1985,8 @@ def main():
                 theme_src = build_cursor_theme(
                     config, theme_name,
                     base_color, outline_color, watch_color,
-                    logger
+                    logger,
+                    transparency_preset
                 )
 
                 # Install

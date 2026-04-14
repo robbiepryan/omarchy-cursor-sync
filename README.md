@@ -84,10 +84,26 @@ source = ~/.config/hypr/cursor-auto.conf
 
 ## Usage
 
+### GUI Color Picker
+
+Launch the interactive color picker with full preset support:
+
+```bash
+cursor-sync --picker
+```
+
+**GUI Features:**
+- 🎨 **HSV Color Controls** - Hue bar + saturation/value pad
+- 🔤 **Hex Input** - Direct hex color entry
+- 🎯 **Persistent Presets** - Save and reuse favorite colors (right-click to remove)
+- 🎲 **Random Color** - Generate vibrant random colors
+- 👁️ **Live Cursor Preview** - See cursor in real-time with selected color
+- ⚡ **Transparency Presets** - Select glass, neon, shadow, or classic effects
+
 ### Manual sync
 
 ```bash
-# Sync cursor to a specific theme
+# Sync cursor to a specific theme (auto-detects transparency)
 cursor-sync catppuccin-mocha
 
 # Preview what colors would be used (no changes)
@@ -95,6 +111,11 @@ cursor-sync one-dark-pro --dry-run
 
 # Force rebuild even if cached
 cursor-sync crimson --force
+
+# Use specific transparency preset
+cursor-sync gruvbox --transparency glass
+cursor-sync tokyo-night --transparency neon
+cursor-sync nord --transparency classic
 ```
 
 ### Automatic sync
@@ -134,6 +155,10 @@ base_color_fallback = "magenta"
 # Outline color source
 # Options: "background", "black", "auto_contrast"
 outline_color_source = "background"
+
+[transparency]
+# "auto" (default), "glass", "shadow", "neon", or "classic"
+preset = "auto"
 ```
 
 ## Color Selection Algorithm
@@ -154,6 +179,92 @@ The tool uses an intelligent algorithm to select aesthetically pleasing cursor c
 ### Watch Color (loading animation)
 1. Uses a darkened version of background
 2. Ensures good visibility for animation states
+
+## Transparency Presets
+
+The tool includes an intelligent theme-aware transparency system that automatically adapts cursor effects to match your theme.
+
+**All presets are cached independently**, so switching between them is instant:
+
+```bash
+cursor-sync catppuccin-mocha                      # ~15s first build with auto-detected preset
+cursor-sync catppuccin-mocha --transparency neon  # ~15s first time, then instant on future use
+cursor-sync catppuccin-mocha --transparency glass # ~15s first time, then instant on future use
+cursor-sync catppuccin-mocha                      # Instant - uses cached version
+```
+
+Each theme + preset combination is cached separately in `~/.local/share/icons/`, so:
+- `Bibata-Omarchy-catppuccin-mocha` (no preset suffix = default/classic)
+- `Bibata-Omarchy-catppuccin-mocha-glass` (glass preset)
+- `Bibata-Omarchy-catppuccin-mocha-neon` (neon preset)
+- `Bibata-Omarchy-catppuccin-mocha-shadow` (shadow preset)
+
+### Preset Types
+
+- **GLASS** (default for dark themes): 75% opacity, polished semi-transparent look
+  - Best for modern, colorful dark themes
+  - Creates a clean, sophisticated aesthetic
+  - Slight transparency makes the underlying content subtly visible
+
+- **SHADOW** (alternative): 95% opacity, nearly opaque
+  - Best for minimal or high-contrast dark themes
+  - Maintains maximum cursor definition and visibility
+  - Subtle shadow-like appearance without transparency
+
+- **NEON** (dark vibrant themes): 60% opacity, more transparent with glow effect
+  - Best for dark themes with vibrant colors
+  - Gaming-oriented and cyberpunk aesthetic
+  - More pronounced transparency for futuristic look
+
+- **CLASSIC** (light themes & accessibility): 100% opacity, fully opaque
+  - Always used for light themes (transparency breaks visibility)
+  - Falls back for accessibility requirements
+  - Maximum cursor contrast and visibility
+
+### Auto-Detection
+
+By default, the preset is automatically selected based on theme properties:
+
+```
+Dark theme + Highly saturated background → NEON
+Dark theme (most cases)                  → GLASS
+Light theme                              → CLASSIC
+```
+
+### Configuration
+
+Set in `config.toml`:
+
+```toml
+[transparency]
+# "auto" (default), "glass", "shadow", "neon", or "classic"
+preset = "auto"
+```
+
+Or override via CLI:
+
+```bash
+cursor-sync my-theme --transparency glass
+cursor-sync my-theme --transparency neon
+```
+
+## Feature Comparison: CLI vs GUI
+
+| Feature | CLI | GUI |
+|---------|-----|-----|
+| **Color Selection** | `--base-color`, `--outline-color`, `--watch-color` | ✓ Full HSV + hex input |
+| **Transparency Presets** | `--transparency` auto/glass/neon/shadow/classic | ✓ Preset buttons |
+| **Theme Selection** | `<theme_name>` positional arg | ✗ Use CLI instead |
+| **Random Color** | `--random` flag | ✓ Random button |
+| **Color Presets** | Config file only | ✓ Persistent swatch grid |
+| **Dry-run Mode** | `--dry-run` flag | ✗ Use CLI instead |
+| **Force Rebuild** | `--force` flag | ✗ Use CLI instead |
+| **Current Theme** | `--current` flag | ✗ Use CLI instead |
+| **Cursor Preview** | Log output only | ✓ Live preview |
+
+**Recommended Usage:**
+- **GUI (`--picker`)**: Perfect for picking colors with live preview and transparency effects
+- **CLI**: For automation, theme-based workflows, and advanced options
 
 ## File Locations
 
