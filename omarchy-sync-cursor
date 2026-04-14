@@ -280,11 +280,14 @@ def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="svg-transparency-"))
 
     try:
-        for svg_file in svg_dir.glob("**/*.svg"):
-            rel_path = svg_file.relative_to(svg_dir)
-            dest_file = temp_dir / rel_path
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
+        # Copy entire SVG directory resolving symlinks. Bibata uses symlinks
+        # extensively (files and subdirectories like left_ptr_watch/, wait/),
+        # and Path.glob("**/*") on Python 3.13+ does not follow symlinked
+        # directories. copytree with symlinks=False resolves all symlinks.
+        shutil.copytree(svg_dir, temp_dir, symlinks=False, dirs_exist_ok=True)
 
+        # Modify SVGs in-place in the copy (all files are real, not symlinks)
+        for svg_file in temp_dir.rglob("*.svg"):
             try:
                 tree = ET.parse(svg_file)
                 root = tree.getroot()
@@ -315,9 +318,9 @@ def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
                         elif 'base' in elem_class or 'fill' in elem_class:
                             elem.set('opacity', str(preset.base_opacity))
 
-                tree.write(dest_file, encoding='utf-8', xml_declaration=True)
+                tree.write(svg_file, encoding='utf-8', xml_declaration=True)
             except Exception:
-                shutil.copy2(svg_file, dest_file)
+                pass  # File was already copied intact by copytree
 
         return temp_dir
     except Exception:
@@ -1560,9 +1563,10 @@ def build_cursor_theme(
 
     process.wait()
 
-    if process.returncode != 0:
-        logger.error(f"ctgen failed: {''.join(output_lines)}")
-        raise RuntimeError(f"ctgen failed")
+    output_text = ''.join(output_lines)
+    if process.returncode != 0 or '[Fail]' in output_text:
+        logger.error(f"ctgen failed: {output_text}")
+        raise RuntimeError("ctgen failed")
 
     logger.info("  Cursor theme build complete")
     
