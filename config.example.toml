@@ -76,6 +76,9 @@ watch_color = ""
 # "neon": More transparent with glow effect (60% opacity for base, 75% outline)
 #   Best for: Dark themes, gaming-oriented setups, cyberpunk aesthetics
 #
+# "outline": Fully transparent fill, visible outline only (0% fill, 100% outline)
+#   Best for: Minimal aesthetic, pairing with --outline-color or picker outline control
+#
 # "classic": Fully opaque, traditional cursor (100% opacity)
 #   Best for: Light themes, accessibility requirements, maximum visibility
 #

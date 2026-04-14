@@ -228,6 +228,7 @@ TRANSPARENCY_PRESETS = {
     "glass": TransparencyPreset("glass", 0.75, 0.85, 0.70),
     "shadow": TransparencyPreset("shadow", 0.95, 1.0, 0.90),
     "neon": TransparencyPreset("neon", 0.60, 0.75, 0.55),
+    "outline": TransparencyPreset("outline", 0.0, 1.0, 0.3),
     "classic": TransparencyPreset("classic", 1.0, 1.0, 1.0),
 }
 
@@ -299,15 +300,31 @@ def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
                         elem_class = elem.get('class', '')
                         elem_id = elem.get('id', '')
 
-                        if 'outline' in elem_class or 'outline' in elem_id or elem.get('stroke'):
-                            opacity = preset.outline_opacity
-                        elif 'watch' in elem_class or 'watch' in elem_id:
-                            opacity = preset.watch_opacity
-                        else:
-                            opacity = preset.base_opacity
+                        has_colored_fill = elem.get('fill', '').lower() not in ('', 'none')
+                        has_stroke = elem.get('stroke', '').lower() not in ('', 'none')
 
-                        if not elem.get('opacity'):
-                            elem.set('opacity', str(opacity))
+                        if has_colored_fill and has_stroke:
+                            # Element has both fill and stroke (e.g. main cursor path):
+                            # use independent fill-opacity/stroke-opacity so fill can
+                            # be made transparent while keeping the outline visible.
+                            if 'watch' in elem_class or 'watch' in elem_id:
+                                f_op, s_op = preset.watch_opacity, preset.watch_opacity
+                            else:
+                                f_op, s_op = preset.base_opacity, preset.outline_opacity
+                            if not elem.get('fill-opacity'):
+                                elem.set('fill-opacity', str(f_op))
+                            if not elem.get('stroke-opacity'):
+                                elem.set('stroke-opacity', str(s_op))
+                        else:
+                            # Single-role element: use unified opacity
+                            if 'outline' in elem_class or 'outline' in elem_id or has_stroke:
+                                opacity = preset.outline_opacity
+                            elif 'watch' in elem_class or 'watch' in elem_id:
+                                opacity = preset.watch_opacity
+                            else:
+                                opacity = preset.base_opacity
+                            if not elem.get('opacity'):
+                                elem.set('opacity', str(opacity))
 
                     elif elem.tag.endswith('}g') or elem.tag == 'g':
                         elem_class = elem.get('class', '')
@@ -496,8 +513,10 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
     # root.overrideredirect(True)
 
     selected_color = [None]
+    selected_outline = [None]  # Track selected outline color for return
     selected_preset = [initial_transparency_preset]  # Track transparency preset selection
     current_hsv = list(colorsys.rgb_to_hsv(*[x/255 for x in hex_to_rgb(initial_color)]))
+    outline_hex = [None]  # None = auto-computed, hex string = custom override
     user_presets = load_presets()
     _updating = [False]
     preset_widgets = []  # Track preset swatches for rebuilding
@@ -549,18 +568,19 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
 
     PREVIEW_W, PREVIEW_H = 200, 180
 
-    def draw_cursor_preview(fill_color, outline_color):
+    def draw_cursor_preview(fill_color, outline_color, outline_only=False):
         """Draw the Bibata cursor with ambient glow effect."""
         preview_canvas.delete("all")
 
         # Draw glass panel background
-        draw_glass_panel(preview_canvas, 0, 0, PREVIEW_W, PREVIEW_H, fill_color)
+        glow_source = outline_color if outline_only else fill_color
+        draw_glass_panel(preview_canvas, 0, 0, PREVIEW_W, PREVIEW_H, glow_source)
 
         cx, cy = PREVIEW_W // 2, PREVIEW_H // 2 + 8
         r_bg, g_bg, b_bg = hex_to_rgb(GLASS)
-        r_fc, g_fc, b_fc = hex_to_rgb(fill_color)
+        r_fc, g_fc, b_fc = hex_to_rgb(glow_source)
 
-        # Ambient glow - more intense, colored by selection
+        # Ambient glow - more intense, colored by visible cursor color
         for i in range(50, 0, -1):
             t = i / 50.0
             blend = t * t * 0.15
@@ -601,15 +621,21 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
         shadow_pts = [p + 3 for p in points]
         preview_canvas.create_polygon(shadow_pts, fill=GLASS_SHADOW, outline="", smooth=True)
 
-        # Outline layer
-        preview_canvas.create_polygon(points, fill=outline_color,
-                                      outline=outline_color, width=10,
-                                      smooth=True, joinstyle=tk.ROUND)
+        if outline_only:
+            # Outline-only mode: hollow cursor with just the border stroke
+            preview_canvas.create_polygon(points, fill="",
+                                          outline=outline_color, width=8,
+                                          smooth=True, joinstyle=tk.ROUND)
+        else:
+            # Outline layer
+            preview_canvas.create_polygon(points, fill=outline_color,
+                                          outline=outline_color, width=10,
+                                          smooth=True, joinstyle=tk.ROUND)
 
-        # Fill layer
-        preview_canvas.create_polygon(points, fill=fill_color,
-                                      outline=fill_color, width=2,
-                                      smooth=True, joinstyle=tk.ROUND)
+            # Fill layer
+            preview_canvas.create_polygon(points, fill=fill_color,
+                                          outline=fill_color, width=2,
+                                          smooth=True, joinstyle=tk.ROUND)
 
     # ══════════════════════════════════════════════════════════════════════════
     # SATURATION/VALUE PAD
@@ -708,9 +734,17 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
 
         color = current_color()
         hex_var.set(color.upper())
-        outline = ensure_contrast(color, VOID)
+        is_outline_mode = selected_preset[0] == "outline"
 
-        draw_cursor_preview(color, outline)
+        # Determine outline color
+        if outline_hex[0]:
+            outline = outline_hex[0]
+        elif is_outline_mode:
+            outline = color  # In outline mode, picked color IS the outline
+        else:
+            outline = ensure_contrast(color, VOID)
+
+        draw_cursor_preview(color, outline, outline_only=is_outline_mode)
         draw_sv_pad()
         draw_hue_bar()
 
@@ -721,6 +755,14 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
             # Inner highlight
             hex_swatch_canvas.create_line(1, 1, 23, 1, fill=lighten_color(color, 0.2))
         except tk.TclError:
+            pass
+
+        # Update outline color swatch
+        try:
+            outline_swatch_canvas.delete("all")
+            outline_swatch_canvas.create_rectangle(0, 0, 24, 24, fill=outline, outline=GLASS_EDGE)
+            outline_swatch_canvas.create_line(1, 1, 23, 1, fill=lighten_color(outline, 0.2))
+        except (tk.TclError, NameError):
             pass
 
         _updating[0] = False
@@ -849,6 +891,13 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
             validate_hex_color(selected_color[0])
         except ValueError:
             selected_color[0] = current_color()
+
+        # Capture outline color for return
+        if outline_hex[0]:
+            selected_outline[0] = outline_hex[0]
+        elif selected_preset[0] == "outline":
+            selected_outline[0] = selected_color[0]
+
         root.quit()
         root.destroy()
 
@@ -862,6 +911,7 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
             else:
                 btn.configure(fg=FG_DIM, bg=GLASS)
                 frame.configure(bg=GLASS)
+        sync_all()  # Update preview for new preset
 
     def cancel():
         root.quit()
@@ -956,6 +1006,80 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
     hue_canvas.bind("<Button-1>", on_hue_event)
     hue_canvas.bind("<B1-Motion>", on_hue_event)
 
+    # ── OUTLINE COLOR SECTION ─────────────────────────────────────────────────
+    outline_section = tk.Frame(main, bg=VOID)
+    outline_section.pack(fill=tk.X, pady=(14, 0))
+
+    outline_header = tk.Frame(outline_section, bg=VOID)
+    outline_header.pack(fill=tk.X, pady=(0, 8))
+
+    tk.Label(outline_header, text="OUTLINE COLOR", font=("Helvetica Neue", 7),
+             fg=FG_FAINT, bg=VOID).pack(side=tk.LEFT)
+
+    # Divider
+    outline_divider = tk.Canvas(outline_header, height=1, bg=VOID, highlightthickness=0)
+    outline_divider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+    outline_divider.create_line(0, 0, 500, 0, fill=FG_FAINT)
+
+    # Auto reset button
+    auto_outline_frame = tk.Frame(outline_header, bg=GLASS_EDGE, padx=1, pady=1)
+    auto_outline_frame.pack(side=tk.RIGHT)
+
+    auto_outline_btn = tk.Label(
+        auto_outline_frame, text=" Auto ", font=("Helvetica Neue", 9),
+        fg=ACCENT, bg=GLASS, padx=6, pady=1, cursor="hand2",
+    )
+    auto_outline_btn.pack()
+
+    def reset_outline_auto():
+        outline_hex[0] = None
+        outline_entry_var.set("auto")
+        sync_all()
+
+    auto_outline_btn.bind("<Button-1>", lambda e: reset_outline_auto())
+    auto_outline_btn.bind("<Enter>", lambda e: auto_outline_btn.configure(bg=GLASS_INNER, fg=FG))
+    auto_outline_btn.bind("<Leave>", lambda e: auto_outline_btn.configure(bg=GLASS, fg=ACCENT))
+
+    # Outline color input row
+    outline_input_container = tk.Frame(outline_section, bg=GLASS_EDGE, padx=1, pady=1)
+    outline_input_container.pack(fill=tk.X)
+
+    outline_input_inner = tk.Frame(outline_input_container, bg=INPUT_BG, padx=8, pady=6)
+    outline_input_inner.pack(fill=tk.X)
+
+    outline_swatch_canvas = tk.Canvas(outline_input_inner, width=24, height=24,
+                                      bg=GLASS, highlightthickness=0, bd=0)
+    outline_swatch_canvas.pack(side=tk.LEFT, padx=(0, 8))
+
+    outline_entry_var = tk.StringVar(value="auto")
+    outline_entry = tk.Entry(
+        outline_input_inner, textvariable=outline_entry_var,
+        font=("JetBrains Mono", 11), fg=ACCENT, bg=INPUT_BG,
+        insertbackground=ACCENT, justify=tk.LEFT,
+        width=9, relief=tk.FLAT, bd=0,
+    )
+    outline_entry.pack(side=tk.LEFT)
+
+    outline_hint = tk.Label(outline_input_inner, text="type hex or 'auto'",
+                            font=("Helvetica Neue", 7), fg=FG_FAINT, bg=INPUT_BG)
+    outline_hint.pack(side=tk.LEFT, padx=(12, 0))
+
+    def on_outline_entry(*_):
+        raw = outline_entry_var.get().strip()
+        if raw.lower() in ("auto", ""):
+            outline_hex[0] = None
+            sync_all()
+            return
+        try:
+            validated = validate_hex_color(raw)
+            outline_hex[0] = validated
+            sync_all()
+        except ValueError:
+            pass
+
+    outline_entry.bind("<Return>", on_outline_entry)
+    outline_entry.bind("<FocusOut>", on_outline_entry)
+
     # ── PRESETS SECTION ────────────────────────────────────────────────────────
     preset_section = tk.Frame(main, bg=VOID)
     preset_section.pack(fill=tk.X, pady=(14, 0))
@@ -1030,6 +1154,7 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
         ("auto", "Auto", "Theme-aware selection"),
         ("glass", "Glass", "75% opacity, polished"),
         ("neon", "Neon", "60% opacity, glow"),
+        ("outline", "Outline", "Fill transparent"),
         ("shadow", "Shadow", "95% opacity, sharp"),
         ("classic", "Classic", "100% opaque"),
     ]
@@ -1133,12 +1258,15 @@ def open_color_picker(initial_color: str = "#ff00ff", initial_transparency_prese
     root.protocol("WM_DELETE_WINDOW", cancel)
     root.mainloop()
 
-    # Return both color and preset, or None if cancelled
+    # Return color, outline, and preset, or None if cancelled
     if selected_color[0]:
-        return {
+        result = {
             "color": selected_color[0],
             "preset": selected_preset[0],
         }
+        if selected_outline[0]:
+            result["outline_color"] = selected_outline[0]
+        return result
     return None
 
 # ============================================================================
@@ -1785,8 +1913,8 @@ def main():
     parser.add_argument(
         "--transparency",
         metavar="PRESET",
-        choices=["auto", "glass", "shadow", "neon", "classic"],
-        help="Transparency preset: auto (default), glass, shadow, neon, or classic"
+        choices=["auto", "glass", "shadow", "neon", "outline", "classic"],
+        help="Transparency preset: auto (default), glass, shadow, neon, outline (fill transparent), or classic"
     )
 
     args = parser.parse_args()
@@ -1818,10 +1946,15 @@ def main():
             picked = open_color_picker(initial)
             if picked:
                 cli_base_color = picked["color"]
+                # Use outline color from picker if provided
+                if picked.get("outline_color"):
+                    cli_outline_color = picked["outline_color"]
                 # Override transparency preset from picker if user selected one
                 if not args.transparency:
                     args.transparency = picked["preset"]
                 logger.info(f"Selected color: {picked['color']} with preset: {picked['preset']}")
+                if picked.get("outline_color"):
+                    logger.info(f"  Outline color: {picked['outline_color']}")
             else:
                 logger.info("Color picker cancelled")
                 sys.exit(0)
