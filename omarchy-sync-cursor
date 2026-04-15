@@ -274,6 +274,111 @@ def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
     """
     import xml.etree.ElementTree as ET
 
+    # Bibata SVGs use color placeholders that cbmp replaces later:
+    # #00FF00 = cursor base, #0000FF = outline, #FF0000 = watch background.
+    # Some cursors, including hand1/hand2 used for link hover, are not stroked
+    # paths. They are two filled layers instead: an outline-colored silhouette
+    # with a base-colored interior drawn on top. In outline mode a simple
+    # base opacity of 0 would make both layers transparent or leave a solid
+    # silhouette, so those paired layers are converted to an even-odd compound
+    # path that renders as a true hollow outline.
+    OUTLINE_COLORS = {"#0000ff"}
+    BASE_COLORS = {"#00ff00"}
+    WATCH_COLORS = {"#ff0000", "#fe0000"}
+
+    def local_name(elem) -> str:
+        return elem.tag.rsplit('}', 1)[-1]
+
+    def normalize_color(color: str) -> str:
+        return color.strip().lower()
+
+    def color_role(color: str) -> Optional[str]:
+        color = normalize_color(color)
+        if color in OUTLINE_COLORS:
+            return "outline"
+        if color in BASE_COLORS:
+            return "base"
+        if color in WATCH_COLORS:
+            return "watch"
+        return None
+
+    def opacity_for_role(
+        role: Optional[str],
+        elem_class: str = "",
+        elem_id: str = "",
+        has_stroke: bool = False
+    ) -> float:
+        if role == "outline":
+            return preset.outline_opacity
+        if role == "watch":
+            return preset.watch_opacity
+        if role == "base":
+            return preset.base_opacity
+
+        if 'outline' in elem_class or 'outline' in elem_id or has_stroke:
+            return preset.outline_opacity
+        if 'watch' in elem_class or 'watch' in elem_id:
+            return preset.watch_opacity
+        return preset.base_opacity
+
+    def convert_layered_fill_outlines(root):
+        """Turn fill-only outline/base pairs into hollow outline shapes."""
+        if preset.base_opacity > 0:
+            return
+
+        parent_map = {
+            child: parent
+            for parent in root.iter()
+            for child in list(parent)
+        }
+        paths_by_parent = {}
+
+        for elem in root.iter():
+            if local_name(elem) != 'path':
+                continue
+
+            fill_role = color_role(elem.get('fill', ''))
+            stroke = normalize_color(elem.get('stroke', ''))
+            has_stroke = stroke not in ('', 'none')
+            if fill_role not in ("outline", "base") or has_stroke or not elem.get('d'):
+                continue
+
+            parent = parent_map.get(elem)
+            if parent is None:
+                continue
+            paths_by_parent.setdefault(parent, []).append((elem, fill_role))
+
+        svg_ns = root.tag.split('}', 1)[0][1:] if root.tag.startswith('{') else ''
+        path_tag = f"{{{svg_ns}}}path" if svg_ns else "path"
+
+        for parent, paths in paths_by_parent.items():
+            roles = {role for _, role in paths}
+            if not {"outline", "base"}.issubset(roles):
+                continue
+
+            children = list(parent)
+            insert_at = min(children.index(elem) for elem, _ in paths)
+            compound_d = " ".join(
+                elem.get('d', '')
+                for elem, role in paths
+                if role == "outline"
+            )
+            compound_d += " " + " ".join(
+                elem.get('d', '')
+                for elem, role in paths
+                if role == "base"
+            )
+
+            compound = ET.Element(path_tag)
+            compound.set('d', compound_d.strip())
+            compound.set('fill', '#0000FF')
+            compound.set('fill-rule', 'evenodd')
+            compound.set('clip-rule', 'evenodd')
+
+            for elem, _ in paths:
+                parent.remove(elem)
+            parent.insert(insert_at, compound)
+
     # If fully opaque, skip modification
     if preset.base_opacity >= 1.0 and preset.outline_opacity >= 1.0 and preset.watch_opacity >= 1.0:
         return svg_dir
@@ -294,39 +399,45 @@ def apply_transparency(svg_dir: Path, preset: TransparencyPreset) -> Path:
                 root = tree.getroot()
 
                 ET.register_namespace('', 'http://www.w3.org/2000/svg')
+                convert_layered_fill_outlines(root)
 
                 for elem in root.iter():
-                    if elem.tag.endswith('}path') or elem.tag == 'path':
+                    if local_name(elem) == 'path':
                         elem_class = elem.get('class', '')
                         elem_id = elem.get('id', '')
 
-                        has_colored_fill = elem.get('fill', '').lower() not in ('', 'none')
-                        has_stroke = elem.get('stroke', '').lower() not in ('', 'none')
+                        fill = normalize_color(elem.get('fill', ''))
+                        stroke = normalize_color(elem.get('stroke', ''))
+                        has_colored_fill = fill not in ('', 'none')
+                        has_stroke = stroke not in ('', 'none')
 
                         if has_colored_fill and has_stroke:
                             # Element has both fill and stroke (e.g. main cursor path):
                             # use independent fill-opacity/stroke-opacity so fill can
                             # be made transparent while keeping the outline visible.
-                            if 'watch' in elem_class or 'watch' in elem_id:
-                                f_op, s_op = preset.watch_opacity, preset.watch_opacity
-                            else:
-                                f_op, s_op = preset.base_opacity, preset.outline_opacity
                             if not elem.get('fill-opacity'):
-                                elem.set('fill-opacity', str(f_op))
+                                elem.set(
+                                    'fill-opacity',
+                                    str(opacity_for_role(color_role(fill), elem_class, elem_id))
+                                )
                             if not elem.get('stroke-opacity'):
-                                elem.set('stroke-opacity', str(s_op))
+                                elem.set(
+                                    'stroke-opacity',
+                                    str(opacity_for_role(
+                                        color_role(stroke),
+                                        elem_class,
+                                        elem_id,
+                                        has_stroke=True
+                                    ))
+                                )
                         else:
                             # Single-role element: use unified opacity
-                            if 'outline' in elem_class or 'outline' in elem_id or has_stroke:
-                                opacity = preset.outline_opacity
-                            elif 'watch' in elem_class or 'watch' in elem_id:
-                                opacity = preset.watch_opacity
-                            else:
-                                opacity = preset.base_opacity
+                            role = color_role(stroke if has_stroke else fill)
+                            opacity = opacity_for_role(role, elem_class, elem_id, has_stroke)
                             if not elem.get('opacity'):
                                 elem.set('opacity', str(opacity))
 
-                    elif elem.tag.endswith('}g') or elem.tag == 'g':
+                    elif local_name(elem) == 'g':
                         elem_class = elem.get('class', '')
                         if 'outline' in elem_class:
                             elem.set('opacity', str(preset.outline_opacity))
@@ -1665,6 +1776,13 @@ def build_cursor_theme(
         raise FileNotFoundError(f"build.toml not found in {config.bibata_source_dir}")
 
     ctgen_path = config.venv_path / "bin" / "ctgen"
+    theme_src = config.bibata_source_dir / "themes" / cursor_theme_name
+
+    # ctgen does not reliably overwrite an existing generated theme; stale
+    # symlinks can make forced rebuilds fail. Remove only this generated
+    # package before rebuilding it.
+    if theme_src.exists():
+        shutil.rmtree(theme_src)
 
     ctgen_cmd = [
         str(ctgen_path),
@@ -1699,7 +1817,6 @@ def build_cursor_theme(
     logger.info("  Cursor theme build complete")
     
     # Find built theme
-    theme_src = config.bibata_source_dir / "themes" / cursor_theme_name
     if not theme_src.exists():
         # Check in current working directory
         theme_src = Path.cwd() / "themes" / cursor_theme_name
